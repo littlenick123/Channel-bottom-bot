@@ -1,0 +1,936 @@
+# Task 3 Report: Storage Preview and Confirmation UI
+
+## Status
+
+Completed and verified.
+
+## Implemented scope
+
+- Added `BotApiGateway.preview_storage_messages(user_id, message_ids)`. It copies the stored messages to the user's private chat in the original order, silently, with the storage channel as the source. It maps rate limits to `FloodWaitSignal` and forbidden/bad-request preview failures to a preview-specific `PermanentPublishError`.
+- Injected `PendingDraftService` into `BotHandlers` and constructed it from the repository, Telegram gateway, draft quota, and pending-draft TTL in `app.py`.
+- Replaced forwarding capture with pending-draft preparation. The handler stores copied content first, sends a private preview, and then presents the persistent confirmation actions. It does not invoke `DraftService.capture` on this route.
+- Preserved album aggregation: the existing 0.8-second aggregation path now prepares one pending item after sorting by Telegram message ID.
+- Added confirmation callbacks:
+  - `p:s:<id>` confirms using the default name and opens the saved draft.
+  - `p:n:<id>` records `await_pending_name` and asks for a 1–100-character name.
+  - `p:x:<id>` discards the pending item and returns to the draft list.
+- Name input trims surrounding whitespace. `/cancel` while naming clears only the naming state and restores the same three pending confirmation actions.
+- A failed private preview displays a warning but still sends the confirmation keyboard. Duplicate/expired pending operations use a single non-leaking message; quota errors only show an alert, leaving the original confirmation UI in place.
+
+## TDD evidence
+
+### RED
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_aiogram_gateway.py tests\test_aiogram_handlers.py -q
+```
+
+Result: `7 failed, 6 passed in 2.55s` (exit 1), with the expected missing behavior:
+
+- `BotApiGateway.preview_storage_messages` did not exist.
+- `BotHandlers` did not accept the `pending_drafts` dependency.
+- The confirmation callbacks and pending-name conversation behavior were consequently unavailable.
+
+### GREEN
+
+The same focused command after the minimal implementation:
+
+```text
+13 passed in 2.50s
+```
+
+The added tests cover the exact storage-to-private `copy_messages` arguments; single forwarded-post preparation without a formal draft; one ordered album preparation; save/name/discard callbacks; trimmed and bounded custom names; `/cancel` returning to the three choices; and a quota error that leaves the callback flow usable.
+
+## Full regression verification
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Result:
+
+```text
+65 passed in 5.52s
+```
+
+## Files changed
+
+- `src/bottom_post_bot/aiogram_gateway.py`
+- `src/bottom_post_bot/handlers.py`
+- `src/bottom_post_bot/app.py`
+- `tests/test_aiogram_gateway.py`
+- `tests/test_aiogram_handlers.py`
+- `.superpowers/sdd/task-3-report.md`
+
+## Requirements review
+
+- Preview sends a source-free storage copy to the requesting user and preserves the passed message-ID order.
+- Pending persistence, atomic confirmation, discard cleanup, and quota retention remain delegated to the Task 2 service/repository interfaces.
+- Forwarded captures now prepare rather than create formal drafts; all confirmation paths route through `PendingDraftService`.
+- Confirmation callback data consists only of the operation code and pending integer ID.
+- A preview-delivery exception cannot leave the user without a confirmation keyboard.
+- Existing draft management, channel handling, and album aggregation remain otherwise unchanged.
+
+## Commit note
+
+No commit was created. The task instruction and workspace context specify an empty/non-functional `.git` directory; no repository was initialized.
+
+## Concerns
+
+None for Task 3. Expired/discarded storage cleanup scheduling is intentionally deferred to Task 7; Task 3 uses the already implemented immediate discard behavior and persistent pending rows.
+
+## Review-fix evidence
+
+### Findings addressed
+
+- `p:n:<id>` now calls `PendingDraftService.assert_confirmable` before it records `await_pending_name`. The service checks owner-scoped existence, `pending` status, and expiry against its clock, returning the existing safe `AuthorizationError` for foreign, terminal, or expired IDs. Atomic confirmation remains the final race-safe check in `Repository.confirm_pending_draft`.
+- A naming confirmation that fails due to expiry/processing or draft quota now clears the conversation state and replies with the same three confirmation actions. Quota handling does not mutate the pending row, so the user can remove an old formal draft and retry from that menu. Unexpected confirmation exceptions also clear the state before propagating to the existing error handler.
+- `Repository.mark_pending_discarded` now accepts `now` and atomically requires `status='pending' AND expires_at>now`. `PendingDraftService.discard` passes its clock value, so an expired row cannot be marked discarded or have storage messages deleted through the discard path; the scheduled cleanup owns it.
+- Added private-preview gateway regressions proving `TelegramRetryAfter` maps to `FloodWaitSignal` and bad-request errors map to the private-preview `PermanentPublishError`.
+- Added UI regressions for preview-copy failure retaining the confirmation keyboard, `p:n` rejection without conversation state, and cleared/reusable state after named-confirm failures. Added service coverage for expired discard avoiding storage deletion.
+
+### Review-fix RED
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_aiogram_gateway.py tests\test_aiogram_handlers.py tests\test_pending_drafts.py -q
+```
+
+Result: `4 failed, 19 passed in 3.10s` (exit 1). The failures exactly exposed absent pre-state confirmability validation, retained naming state after failed confirmation, and expired discard deleting storage content. The new gateway mappings already passed because that part of Task 3 was present.
+
+One further interaction RED test required a failed named confirmation to restore the confirmation keyboard:
+
+```text
+1 failed, 10 passed in 2.63s
+```
+
+It failed with the expected unhandled `AuthorizationError` before a keyboard could be sent.
+
+### Review-fix GREEN
+
+The covering focused command passed after the minimal service, repository, and handler changes:
+
+```text
+23 passed in 2.81s
+```
+
+### Review-fix full regression
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+```text
+71 passed in 5.73s
+```
+
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+from collections.abc import Sequence
+
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    LinkPreviewOptions,
+    MessageEntity,
+)
+
+from .channels import ChannelIdentity
+from .domain import ButtonSpec, ContentItem
+from .drafts import IncomingContent
+from .permissions import BotCapabilities
+from .publisher import FloodWaitSignal, PermanentPublishError
+
+
+TRANSIENT_ERRORS = (TelegramNetworkError, TelegramServerError)
+ADMIN_STATUSES = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, "creator", "administrator"}
+
+
+def _message_id(value) -> int:
+    return int(getattr(value, "message_id", getattr(value, "id", 0)))
+
+
+def _entities(value: str) -> list[MessageEntity]:
+    if not value:
+        return []
+    return [MessageEntity.model_validate(entity) for entity in json.loads(value)]
+
+
+class BotApiPermissionGateway:
+    def __init__(self, bot) -> None:
+        self.bot = bot
+        self._bot_id: int | None = None
+
+    async def resolve_channel(self, reference: str | int) -> ChannelIdentity:
+        chat = await self.bot.get_chat(reference)
+        chat_type = getattr(chat.type, "value", chat.type)
+        if chat_type not in {"channel", "supergroup"}:
+            raise ValueError("目标不是 Telegram 频道或超级群组")
+        return ChannelIdentity(int(chat.id), str(chat.title or chat.id), getattr(chat, "username", None))
+
+    async def user_is_admin(self, channel_id: int, user_id: int) -> bool:
+        try:
+            member = await self.bot.get_chat_member(channel_id, user_id)
+            return member.status in ADMIN_STATUSES
+        except (TelegramForbiddenError, TelegramBadRequest):
+            return False
+
+    async def bot_capabilities(self, channel_id: int) -> BotCapabilities:
+        if self._bot_id is None:
+            self._bot_id = int((await self.bot.get_me()).id)
+        try:
+            member = await self.bot.get_chat_member(channel_id, self._bot_id)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            return BotCapabilities(False, False, False)
+        creator = member.status in {ChatMemberStatus.CREATOR, "creator"}
+        admin = member.status in ADMIN_STATUSES
+        return BotCapabilities(
+            is_admin=admin,
+            can_post=creator or bool(getattr(member, "can_post_messages", False)),
+            can_delete=creator or bool(getattr(member, "can_delete_messages", False)),
+        )
+
+
+class BotApiGateway:
+    def __init__(self, bot, storage_channel_id: int) -> None:
+        self.bot = bot
+        self.storage_channel_id = storage_channel_id
+
+    async def copy_messages(self, messages: Sequence[IncomingContent]) -> list[int]:
+        if not messages:
+            return []
+        if len({message.source_chat_id for message in messages}) != 1:
+            raise ValueError("同一草稿批次的消息必须来自同一会话")
+        try:
+            copied = await self.bot.copy_messages(
+                chat_id=self.storage_channel_id,
+                from_chat_id=messages[0].source_chat_id,
+                message_ids=[message.source_message_id for message in messages],
+                disable_notification=True,
+            )
+            return [_message_id(item) for item in copied]
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PermanentPublishError(f"存储频道复制失败：{exc}") from exc
+
+    async def preview_storage_messages(self, user_id: int, message_ids: Sequence[int]) -> list[int]:
+        if not message_ids:
+            return []
+        try:
+            copied = await self.bot.copy_messages(
+                chat_id=user_id,
+                from_chat_id=self.storage_channel_id,
+                message_ids=list(message_ids),
+                disable_notification=True,
+            )
+            return [_message_id(item) for item in copied]
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PermanentPublishError(f"私聊预览复制失败：{exc}") from exc
+
+    async def delete_messages(self, channel_id: int, message_ids: list[int]) -> None:
+        if not message_ids:
+            return
+        try:
+            await self.bot.delete_messages(chat_id=channel_id, message_ids=message_ids)
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except TelegramBadRequest as exc:
+            if "not found" in str(exc).lower() or "can't be deleted" in str(exc).lower():
+                return
+            raise PermanentPublishError(f"无法删除旧置底帖：{exc}") from exc
+        except TelegramForbiddenError as exc:
+            raise PermanentPublishError(f"无法删除旧置底帖：{exc}") from exc
+
+    async def delete_storage_messages(self, message_ids: list[int]) -> None:
+        await self.delete_messages(self.storage_channel_id, message_ids)
+
+    async def send_content(
+        self,
+        channel_id: int,
+        item: ContentItem,
+        buttons: Sequence[ButtonSpec],
+        silent: bool,
+    ) -> list[int]:
+        common = {
+            "chat_id": channel_id,
+            "disable_notification": silent,
+            "reply_markup": self._build_buttons(buttons),
+        }
+        entities = _entities(item.formatting_entities_json)
+        try:
+            if not item.media_kind:
+                sent = await self.bot.send_message(
+                    **common,
+                    text=item.text or "\u200b",
+                    entities=entities or None,
+                    link_preview_options=LinkPreviewOptions(is_disabled=False),
+                )
+            else:
+                sent = await self._send_media(item, entities, common)
+            return [_message_id(sent)]
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PermanentPublishError(f"频道发帖失败：{exc}") from exc
+        except TRANSIENT_ERRORS:
+            raise
+
+    async def _send_media(self, item: ContentItem, entities: list[MessageEntity], common: dict):
+        if not item.telegram_file_id:
+            raise PermanentPublishError("媒体草稿缺少 Bot API file_id")
+        caption = item.text or None
+        kind = item.media_kind.lower()
+        if kind == "photo":
+            return await self.bot.send_photo(**common, photo=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+        if kind == "video":
+            return await self.bot.send_video(**common, video=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+        if kind == "animation":
+            return await self.bot.send_animation(**common, animation=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+        if kind == "audio":
+            return await self.bot.send_audio(**common, audio=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+        if kind == "voice":
+            return await self.bot.send_voice(**common, voice=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+        if kind == "sticker":
+            common.pop("reply_markup", None)
+            return await self.bot.send_sticker(**common, sticker=item.telegram_file_id)
+        return await self.bot.send_document(**common, document=item.telegram_file_id, caption=caption, caption_entities=entities or None)
+
+    async def send_content_group(
+        self,
+        channel_id: int,
+        items: Sequence[ContentItem],
+        buttons: Sequence[ButtonSpec],
+        silent: bool,
+    ) -> list[int]:
+        try:
+            media = [self._input_media(item) for item in items]
+            sent = await self.bot.send_media_group(
+                chat_id=channel_id,
+                media=media,
+                disable_notification=silent,
+            )
+            ids = [_message_id(message) for message in sent]
+            if buttons:
+                button_message = await self.bot.send_message(
+                    chat_id=channel_id,
+                    text="\u200b",
+                    reply_markup=self._build_buttons(buttons),
+                    disable_notification=silent,
+                )
+                ids.append(_message_id(button_message))
+            return ids
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PermanentPublishError(f"频道相册发布失败：{exc}") from exc
+
+    @staticmethod
+    def _input_media(item: ContentItem):
+        if not item.telegram_file_id:
+            raise PermanentPublishError("相册媒体缺少 Bot API file_id")
+        entities = _entities(item.formatting_entities_json) or None
+        kind = item.media_kind.lower()
+        kwargs = {"media": item.telegram_file_id, "caption": item.text or None, "caption_entities": entities}
+        if kind == "photo":
+            return InputMediaPhoto(**kwargs)
+        if kind == "video":
+            return InputMediaVideo(**kwargs)
+        if kind == "audio":
+            return InputMediaAudio(**kwargs)
+        return InputMediaDocument(**kwargs)
+
+    @staticmethod
+    def _build_buttons(buttons: Sequence[ButtonSpec]) -> InlineKeyboardMarkup | None:
+        if not buttons:
+            return None
+        rows: defaultdict[int, list[ButtonSpec]] = defaultdict(list)
+        for button in buttons:
+            rows[button.row].append(button)
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=button.text, url=button.url) for button in sorted(rows[row], key=lambda value: value.column)]
+                for row in sorted(rows)
+            ]
+        )
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from typing import Sequence
+
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from .config import Settings
+from .domain import ButtonSpec
+from .drafts import DraftService, IncomingContent
+from .pending_drafts import PendingDraftService
+from .permissions import PermissionDenied, PermissionService
+from .repositories import AuthorizationError, Repository, ResourceLimitError
+
+
+logger = logging.getLogger(__name__)
+
+HELP_TEXT = """频道置底机器人
+
+1. 把机器人加入频道并授予发帖、删除消息权限。
+2. 在“我的频道”绑定公开用户名、频道 ID，或转发频道帖子。
+3. 转发帖子给机器人保存为个人草稿，可配置 URL 按钮。
+4. 把草稿发布到编号槽位；机器人按大编号到小编号发送，1 号位于最底部。
+
+命令：/start /status /cancel /help"""
+
+PENDING_UNAVAILABLE_MESSAGE = "该待确认内容已处理或已过期。"
+
+
+def _cb(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def _markup(rows) -> InlineKeyboardMarkup | None:
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def parse_button_input(value: str) -> ButtonSpec:
+    parts = [part.strip() for part in value.split("|")]
+    if len(parts) not in {2, 3} or not parts[0] or not parts[1]:
+        raise ValueError("请使用：按钮文字 | URL | 行号（行号可省略）")
+    try:
+        row = int(parts[2]) if len(parts) == 3 else 1
+    except ValueError as exc:
+        raise ValueError("按钮行号必须是正整数") from exc
+    if row < 1:
+        raise ValueError("按钮行号必须从 1 开始")
+    return ButtonSpec(parts[0], parts[1], row - 1, 0)
+
+
+def message_to_incoming(message: Message) -> IncomingContent:
+    text = getattr(message, "text", None) or getattr(message, "caption", None)
+    entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []
+    serialized = [entity.model_dump(mode="json", exclude_none=True) for entity in entities]
+    media_kind: str | None = None
+    file_id: str | None = None
+    photos = getattr(message, "photo", None)
+    if photos:
+        media_kind, file_id = "photo", photos[-1].file_id
+    else:
+        for kind in ("video", "animation", "document", "audio", "voice", "sticker"):
+            media = getattr(message, kind, None)
+            if media is not None:
+                media_kind, file_id = kind, media.file_id
+                break
+    return IncomingContent(
+        source_chat_id=int(message.chat.id),
+        source_message_id=int(message.message_id),
+        text=text,
+        media_kind=media_kind,
+        grouped_id=str(message.media_group_id) if getattr(message, "media_group_id", None) else None,
+        formatting_entities_json=json.dumps(serialized, ensure_ascii=False, separators=(",", ":")),
+        file_id=file_id,
+    )
+
+
+class BotHandlers:
+    def __init__(
+        sel…18097 tokens truncated… test_preview_storage_messages_translates_retry_after(self) -> None:
+        bot = FakeBot()
+        bot.copy_error = TelegramRetryAfter(GetMe(), "slow down", retry_after=3)
+
+        with self.assertRaises(FloodWaitSignal) as raised:
+            await BotApiGateway(bot, storage_channel_id=-10050).preview_storage_messages(42, [700])
+
+        self.assertEqual(raised.exception.seconds, 3)
+
+    async def test_preview_storage_messages_translates_private_preview_errors(self) -> None:
+        bot = FakeBot()
+        bot.copy_error = TelegramBadRequest(GetMe(), "chat not found")
+
+        with self.assertRaisesRegex(PermanentPublishError, "私聊预览"):
+            await BotApiGateway(bot, storage_channel_id=-10050).preview_storage_messages(42, [700])
+
+    async def test_send_photo_uses_persistent_file_id_and_url_keyboard(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        item = ContentItem(
+            text="caption",
+            storage_message_id=701,
+            media_kind="photo",
+            telegram_file_id="photo-file",
+        )
+        buttons = [ButtonSpec("官网", "https://example.com", 0, 0)]
+
+        ids = await gateway.send_content(-1007, item, buttons, silent=True)
+
+        self.assertEqual(ids, [902])
+        self.assertEqual(bot.photo_calls[0]["photo"], "photo-file")
+        self.assertTrue(bot.photo_calls[0]["disable_notification"])
+        self.assertEqual(bot.photo_calls[0]["reply_markup"].inline_keyboard[0][0].url, "https://example.com")
+
+    async def test_send_album_uses_media_group(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        items = [
+            ContentItem(text="caption", storage_message_id=1, media_kind="photo", grouped_id="g", telegram_file_id="p1"),
+            ContentItem(storage_message_id=2, media_kind="photo", grouped_id="g", telegram_file_id="p2"),
+        ]
+
+        ids = await gateway.send_content_group(-1007, items, (), silent=False)
+
+        self.assertEqual(ids, [910, 911])
+        self.assertEqual([media.media for media in bot.album_calls[0]["media"]], ["p1", "p2"])
+
+    async def test_permission_gateway_uses_get_chat_member(self) -> None:
+        gateway = BotApiPermissionGateway(FakeBot())
+        channel = await gateway.resolve_channel("@news")
+        self.assertEqual(channel.id, -1007)
+        self.assertTrue(await gateway.user_is_admin(channel.id, 1))
+        self.assertTrue((await gateway.bot_capabilities(channel.id)).ready)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from bottom_post_bot.domain import ContentItem, Draft, DraftRevision, PendingDraft
+from bottom_post_bot.handlers import BotHandlers, message_to_incoming
+from bottom_post_bot.repositories import AuthorizationError, ResourceLimitError
+
+
+class FakeRepository:
+    def __init__(self) -> None:
+        self.conversations = {}
+        self.cleared = []
+        self.set_states = []
+
+    async def upsert_user(self, user_id, display_name):
+        return None
+
+    async def get_conversation(self, user_id):
+        return self.conversations.get(user_id)
+
+    async def clear_conversation(self, user_id):
+        self.cleared.append(user_id)
+        self.conversations.pop(user_id, None)
+
+    async def set_conversation(self, user_id, state, payload, expires_at):
+        self.conversations[user_id] = (state, payload)
+        self.set_states.append((user_id, state, payload))
+
+
+class FakeDraftService:
+    def __init__(self) -> None:
+        self.capture_calls = []
+
+    async def capture(self, *args):
+        self.capture_calls.append(args)
+        raise AssertionError("forwarded content must be prepared before creating a draft")
+
+
+class FakePendingDrafts:
+    def __init__(self) -> None:
+        self.prepare_calls = []
+        self.confirm_calls = []
+        self.discard_calls = []
+        self.fail_confirm_with = None
+        self.fail_confirmable_with = None
+        self.confirmable_calls = []
+        self.draft = Draft(11, 42, "保存的草稿", DraftRevision(12, 1, (ContentItem(text="正文"),)))
+
+    async def prepare(self, user_id, messages):
+        self.prepare_calls.append((user_id, tuple(messages)))
+        return PendingDraft(
+            7,
+            user_id,
+            tuple(
+                ContentItem(
+                    text=item.text,
+                    storage_message_id=700 + index,
+                    media_kind=item.media_kind,
+                    telegram_file_id=item.file_id,
+                    grouped_id=item.grouped_id,
+                    formatting_entities_json=item.formatting_entities_json,
+                )
+                for index, item in enumerate(messages)
+            ),
+            999.0,
+        )
+
+    async def confirm(self, pending_id, user_id, name=None):
+        self.confirm_calls.append((pending_id, user_id, name))
+        if self.fail_confirm_with:
+            raise self.fail_confirm_with
+        return self.draft
+
+    async def assert_confirmable(self, pending_id, user_id):
+        self.confirmable_calls.append((pending_id, user_id))
+        if self.fail_confirmable_with:
+            raise self.fail_confirmable_with
+
+    async def discard(self, pending_id, user_id):
+        self.discard_calls.append((pending_id, user_id))
+        return True
+
+
+class FakeGateway:
+    def __init__(self) -> None:
+        self.preview_calls = []
+        self.preview_error = None
+
+    async def preview_storage_messages(self, user_id, message_ids):
+        self.preview_calls.append((user_id, list(message_ids)))
+        if self.preview_error:
+            raise self.preview_error
+        return [900 + index for index, _ in enumerate(message_ids)]
+
+
+class FakeMessage(SimpleNamespace):
+    def __init__(self, **kwargs) -> None:
+        self.answers = []
+        super().__init__(**kwargs)
+
+    async def answer(self, text, reply_markup=None):
+        self.answers.append((text, reply_markup))
+
+
+def forwarded_message(message_id=1, *, media_group_id=None, text="转发正文"):
+    return FakeMessage(
+        chat=SimpleNamespace(id=900, type="private"),
+        message_id=message_id,
+        text=text,
+        caption=None,
+        entities=[],
+        caption_entities=None,
+        media_group_id=media_group_id,
+        photo=None,
+        video=None,
+        animation=None,
+        document=None,
+        audio=None,
+        voice=None,
+        sticker=None,
+        forward_origin=SimpleNamespace(chat=SimpleNamespace(id=-1007)),
+        forward_from_chat=None,
+        from_user=SimpleNamespace(id=42, first_name="Alice", last_name=None, full_name="Alice"),
+    )
+
+
+class PendingDraftConfirmationHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.repository = FakeRepository()
+        self.drafts = FakeDraftService()
+        self.pending = FakePendingDrafts()
+        self.gateway = FakeGateway()
+        self.settings = SimpleNamespace(
+            conversation_timeout_seconds=900,
+            max_drafts_per_user=50,
+            max_slots_per_channel=10,
+            operator_user_ids=frozenset(),
+        )
+        self.handlers = BotHandlers(
+            SimpleNamespace(),
+            self.repository,
+            self.drafts,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            self.gateway,
+            self.settings,
+            pending_drafts=self.pending,
+        )
+
+    async def test_forwarded_post_prepares_previews_and_does_not_create_formal_draft(self) -> None:
+        message = forwarded_message()
+
+        await self.handlers.on_private_message(message)
+
+        self.assertEqual(len(self.pending.prepare_calls), 1)
+        self.assertEqual(self.drafts.capture_calls, [])
+        self.assertEqual(self.gateway.preview_calls, [(42, [700])])
+        self.assertEqual(message.answers[-1][0], "已保存预览，请确认是否保存为草稿。")
+        callbacks = [button.callback_data for row in message.answers[-1][1].inline_keyboard for button in row]
+        self.assertEqual(callbacks, ["p:s:7", "p:n:7", "p:x:7"])
+
+    async def test_preview_failure_still_sends_warning_and_usable_confirmation_keyboard(self) -> None:
+        self.gateway.preview_error = RuntimeError("private chat unavailable")
+        message = forwarded_message()
+
+        await self.handlers.on_private_message(message)
+
+        self.assertEqual(message.answers[0][0], "预览发送失败，但待确认内容已保存。")
+        callbacks = [button.callback_data for row in message.answers[-1][1].inline_keyboard for button in row]
+        self.assertEqual(callbacks, ["p:s:7", "p:n:7", "p:x:7"])
+
+    async def test_album_prepares_once_in_message_id_order(self) -> None:
+        first = forwarded_message(2, media_group_id="album")
+        second = forwarded_message(1, media_group_id="album")
+        key = (900, "album")
+        self.handlers._album_messages[key] = [first, second]
+
+        with patch("bottom_post_bot.handlers.asyncio.sleep", new=AsyncMock()):
+            await self.handlers._flush_album_after(key)
+
+        self.assertEqual(len(self.pending.prepare_calls), 1)
+        self.assertEqual([item.source_message_id for item in self.pending.prepare_calls[0][1]], [1, 2])
+        self.assertEqual(self.gateway.preview_calls, [(42, [700, 701])])
+
+    async def test_callbacks_save_name_or_discard_pending_draft(self) -> None:
+        event = SimpleNamespace()
+        self.handlers._show_draft = AsyncMock()
+        self.handlers._show = AsyncMock()
+        self.handlers._show_drafts = AsyncMock()
+
+        await self.handlers._dispatch_callback(event, 42, "p:s:7")
+        await self.handlers._dispatch_callback(event, 42, "p:n:8")
+        await self.handlers._dispatch_callback(event, 42, "p:x:9")
+
+        self.assertEqual(self.pending.confirm_calls, [(7, 42, None)])
+        self.handlers._show_draft.assert_awaited_once_with(event, 42, 11)
+        self.assertEqual(self.pending.confirmable_calls, [(8, 42)])
+        self.assertEqual(self.repository.set_states[-1][:3], (42, "await_pending_name", {"pending_id": 8}))
+        self.assertEqual(self.pending.discard_calls, [(9, 42)])
+        self.handlers._show_drafts.assert_awaited_once_with(event, 42)
+
+    async def test_named_save_rejects_foreign_or_expired_pending_without_setting_state(self) -> None:
+        event = SimpleNamespace()
+        self.handlers._show = AsyncMock()
+        for failure in (AuthorizationError("pending draft already processed or expired"), AuthorizationError("pending draft already processed or expired")):
+            self.pending.fail_confirmable_with = failure
+
+            with self.assertRaises(AuthorizationError):
+                await self.handlers._dispatch_callback(event, 42, "p:n:7")
+
+            self.assertEqual(self.repository.set_states, [])
+        self.assertEqual(self.pending.confirmable_calls, [(7, 42), (7, 42)])
+
+    async def test_custom_name_is_trimmed_and_must_be_between_one_and_one_hundred_characters(self) -> None:
+        message = forwarded_message(text="  自定义名称  ")
+        self.handlers._show_draft = AsyncMock()
+
+        await self.handlers._handle_state(message, 42, "await_pending_name", {"pending_id": 7})
+
+        self.assertEqual(self.pending.confirm_calls, [(7, 42, "自定义名称")])
+        self.assertEqual(self.repository.cleared, [42])
+        self.handlers._show_draft.assert_awaited_once_with(message, 42, 11)
+        with self.assertRaisesRegex(ValueError, "1 到 100"):
+            await self.handlers._handle_state(forwarded_message(text=" "), 42, "await_pending_name", {"pending_id": 7})
+        with self.assertRaisesRegex(ValueError, "1 到 100"):
+            await self.handlers._handle_state(forwarded_message(text="x" * 101), 42, "await_pending_name", {"pending_id": 7})
+
+    async def test_naming_confirmation_failure_clears_state_for_retry_from_confirmation_menu(self) -> None:
+        self.handlers._show_draft = AsyncMock()
+        for failure in (AuthorizationError("pending draft already processed or expired"), ResourceLimitError("草稿数量已达上限")):
+            self.repository.conversations[42] = ("await_pending_name", {"pending_id": 7})
+            self.pending.fail_confirm_with = failure
+            message = forwarded_message(text="名称")
+
+            await self.handlers._handle_state(message, 42, "await_pending_name", {"pending_id": 7})
+
+            self.assertNotIn(42, self.repository.conversations)
+            callbacks = [button.callback_data for row in message.answers[-1][1].inline_keyboard for button in row]
+            self.assertEqual(callbacks, ["p:s:7", "p:n:7", "p:x:7"])
+        self.handlers._show_draft.assert_not_awaited()
+
+    async def test_cancel_naming_keeps_pending_draft_and_reopens_confirmation_actions(self) -> None:
+        self.repository.conversations[42] = ("await_pending_name", {"pending_id": 7})
+        message = forwarded_message(text="/cancel")
+
+        await self.handlers.on_private_message(message)
+
+        self.assertEqual(self.pending.discard_calls, [])
+        callbacks = [button.callback_data for row in message.answers[-1][1].inline_keyboard for button in row]
+        self.assertEqual(callbacks, ["p:s:7", "p:n:7", "p:x:7"])
+        self.assertNotIn(42, self.repository.conversations)
+
+    async def test_quota_error_leaves_confirmation_callback_usable(self) -> None:
+        self.pending.fail_confirm_with = ResourceLimitError("草稿数量已达上限")
+        event = SimpleNamespace(answer=AsyncMock())
+
+        await self.handlers.on_callback(SimpleNamespace(from_user=SimpleNamespace(id=42, full_name="Alice"), data="p:s:7", answer=event.answer))
+
+        self.assertEqual(self.pending.confirm_calls, [(7, 42, None)])
+        event.answer.assert_awaited_once_with("草稿数量已达上限", show_alert=True)
+
+
+class AiogramMessageConversionTests(unittest.TestCase):
+    def test_photo_message_extracts_largest_file_id_and_media_group(self) -> None:
+        entity = SimpleNamespace(model_dump=lambda **kwargs: {"type": "bold", "offset": 0, "length": 3})
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=12),
+            message_id=34,
+            text=None,
+            caption="广告",
+            entities=None,
+            caption_entities=[entity],
+            media_group_id="group-1",
+            photo=[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="large")],
+            video=None,
+            animation=None,
+            document=None,
+            audio=None,
+            voice=None,
+            sticker=None,
+        )
+
+        incoming = message_to_incoming(message)
+
+        self.assertEqual(incoming.source_chat_id, 12)
+        self.assertEqual(incoming.source_message_id, 34)
+        self.assertEqual(incoming.media_kind, "photo")
+        self.assertEqual(incoming.file_id, "large")
+        self.assertEqual(incoming.grouped_id, "group-1")
+        self.assertEqual(json.loads(incoming.formatting_entities_json)[0]["type"], "bold")
+
+    def test_plain_text_has_no_file_id(self) -> None:
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=12),
+            message_id=35,
+            text="hello",
+            caption=None,
+            entities=[],
+            caption_entities=None,
+            media_group_id=None,
+            photo=None,
+            video=None,
+            animation=None,
+            document=None,
+            audio=None,
+            voice=None,
+            sticker=None,
+        )
+        incoming = message_to_incoming(message)
+        self.assertEqual(incoming.text, "hello")
+        self.assertIsNone(incoming.file_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from bottom_post_bot.database import Database
+from bottom_post_bot.drafts import IncomingContent
+from bottom_post_bot.pending_drafts import PendingDraftService
+from bottom_post_bot.repositories import Repository
+
+
+class FakeStorage:
+    def __init__(self) -> None:
+        self.copy_calls: list[tuple[IncomingContent, ...]] = []
+        self.deleted_ids: list[list[int]] = []
+        self.delete_error: Exception | None = None
+
+    async def copy_messages(self, messages):
+        self.copy_calls.append(tuple(messages))
+        return [700 + index for index, _ in enumerate(messages)]
+
+    async def delete_storage_messages(self, message_ids):
+        self.deleted_ids.append(list(message_ids))
+        if self.delete_error:
+            raise self.delete_error
+
+
+class PendingDraftServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db = await Database.open(Path(self.tempdir.name) / "test.sqlite3")
+        self.repo = Repository(self.db)
+        await self.repo.upsert_user(1, "Alice")
+        self.storage = FakeStorage()
+        self.service = PendingDraftService(self.repo, self.storage, max_drafts=50, ttl_seconds=60, clock=lambda: 100.0)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        self.tempdir.cleanup()
+
+    async def test_prepare_copies_once_and_confirm_uses_content_summary(self) -> None:
+        pending = await self.service.prepare(
+            1,
+            [
+                IncomingContent(10, 1, "  album\n title  ", "photo", "group", "[]"),
+                IncomingContent(10, 2, None, "photo", "group", "[]"),
+            ],
+        )
+
+        draft = await self.service.confirm(pending.id, 1)
+
+        self.assertEqual(len(self.storage.copy_calls), 1)
+        self.assertEqual(draft.name, "album title")
+        self.assertEqual([item.storage_message_id for item in draft.current_revision.items], [700, 701])
+
+    async def test_discard_marks_then_deletes_storage_items(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "discard", None, None, "[]")])
+
+        discarded = await self.service.discard(pending.id, 1)
+
+        self.assertTrue(discarded)
+        self.assertEqual(self.storage.deleted_ids, [[700]])
+        cleanup = await self.repo.list_pending_cleanup(now=100.0)
+        self.assertEqual([item.id for item in cleanup], [pending.id])
+
+    async def test_discard_rejects_expired_pending_without_deleting_storage_items(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "expired", None, None, "[]")])
+        self.service.clock = lambda: 160.0
+
+        discarded = await self.service.discard(pending.id, 1)
+
+        self.assertFalse(discarded)
+        self.assertEqual(self.storage.deleted_ids, [])
+        row = await self.db.fetch_one("SELECT status FROM pending_drafts WHERE id=?", (pending.id,))
+        self.assertEqual(row["status"], "pending")
+
+    async def test_expired_cleanup_retries_terminal_rows(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "expired", None, None, "[]")])
+
+        cleaned = await self.service.cleanup_expired(now=160.0)
+
+        self.assertEqual(cleaned, 1)
+        self.assertEqual(self.storage.deleted_ids, [[700]])
+        self.assertIsNone(await self.repo.get_pending_draft(1, pending.id))
+
+    async def test_cleanup_keeps_terminal_row_when_deletion_fails_for_retry(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "retry", None, None, "[]")])
+        self.storage.delete_error = RuntimeError("temporary deletion failure")
+
+        cleaned = await self.service.cleanup_expired(now=160.0)
+
+        self.assertEqual(cleaned, 0)
+        row = await self.db.fetch_one("SELECT status FROM pending_drafts WHERE id=?", (pending.id,))
+        self.assertEqual(row["status"], "expired")
+        self.storage.delete_error = None
+        self.assertEqual(await self.service.cleanup_expired(now=161.0), 1)
+        self.assertEqual(self.storage.deleted_ids, [[700], [700]])
+
+
+if __name__ == "__main__":
+    unittest.main()

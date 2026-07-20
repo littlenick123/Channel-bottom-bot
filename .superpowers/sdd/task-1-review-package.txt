@@ -1,0 +1,844 @@
+# Task 1 Report: Schema, Settings, and Domain Types
+
+## Status
+
+DONE
+
+## Implementation
+
+- Added `Settings.pending_draft_ttl_seconds` and `Settings.pending_cleanup_interval_seconds`, both parsed as positive integers with defaults of 600 and 60 seconds.
+- Added `PendingDraft`, an immutable slots dataclass with the requested pending status default.
+- Extended `SlotSnapshot` with backward-compatible `display_name` and `name_customized` defaults.
+- Added transactional schema migration 4. It creates pending-draft tables, adds and backfills slot-name columns, creates the pending-expiration index, and records version 4 only after all statements complete.
+- Added the two pending-draft environment values to `.env.example`.
+- Added coverage for new settings, domain values, version-3 backfill migration, and migration-4 rollback behavior.
+
+## TDD Evidence
+
+### RED
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_config.py tests\test_domain.py tests\test_database.py -q
+```
+
+Output summary:
+
+```text
+7 failed, 13 passed in 1.04s
+```
+
+The failures were the intended missing settings attributes and validation, missing `PendingDraft`, absent `SlotSnapshot` fields, missing migration 4/version 4, and absent `MIGRATION_4` statement tuple.
+
+### GREEN
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_config.py tests\test_domain.py tests\test_database.py -q
+```
+
+Output:
+
+```text
+20 passed in 1.14s
+```
+
+### Full Regression
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Output:
+
+```text
+49 passed in 5.04s
+```
+
+## Files Changed
+
+- `.env.example`
+- `src/bottom_post_bot/config.py`
+- `src/bottom_post_bot/database.py`
+- `src/bottom_post_bot/domain.py`
+- `tests/test_config.py`
+- `tests/test_database.py`
+- `tests/test_domain.py`
+- `.superpowers/sdd/task-1-report.md`
+
+## Self-Review
+
+- The new `SlotSnapshot` fields are appended after `enabled`, preserving existing positional and keyword callers.
+- Migration 4 executes each SQL statement after `BEGIN IMMEDIATE`; the existing exception handler rolls back the transaction, so a failing statement leaves schema version 3 and no preceding migration-4 schema changes.
+- The backfill uses the assigned revision's draft name and falls back to `置底帖子 N` where the revision has no associated draft.
+- Tests cover both the successful version-3 migration path and a deliberately invalid final migration statement to verify atomic rollback.
+
+## Concerns
+
+The workspace is not a valid Git repository: `git status` and `git diff` report `fatal: not a git repository`. Per task instruction, no repository was initialized and no commit was attempted.
+
+## Commit Note
+
+No commit created because the supplied workspace has an empty/non-functional `.git` directory.
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class ConfigurationError(ValueError):
+    """Raised when environment configuration is missing or invalid."""
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ConfigurationError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _integer(name: str, default: int | None = None, *, positive: bool = False) -> int:
+    raw = os.getenv(name)
+    if raw is None and default is not None:
+        value = default
+    else:
+        try:
+            value = int(_required(name) if raw is None else raw)
+        except ValueError as exc:
+            raise ConfigurationError(f"{name} must be an integer") from exc
+    if positive and value <= 0:
+        raise ConfigurationError(f"{name} must be greater than zero")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    bot_token: str
+    storage_channel_id: int
+    operator_user_ids: frozenset[int]
+    database_path: Path = Path("data/bot.sqlite3")
+    refresh_delay_seconds: int = 10
+    max_channels_per_user: int = 10
+    max_drafts_per_user: int = 50
+    max_slots_per_channel: int = 10
+    log_level: str = "INFO"
+    conversation_timeout_seconds: int = 900
+    pending_draft_ttl_seconds: int = 600
+    pending_cleanup_interval_seconds: int = 60
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        bot_token = _required("TELEGRAM_BOT_TOKEN")
+        storage_channel_id = _integer("STORAGE_CHANNEL_ID")
+        operators_raw = _required("OPERATOR_USER_IDS")
+        try:
+            operators = frozenset(int(value.strip()) for value in operators_raw.split(",") if value.strip())
+        except ValueError as exc:
+            raise ConfigurationError("OPERATOR_USER_IDS must be comma-separated integers") from exc
+        if not operators:
+            raise ConfigurationError("OPERATOR_USER_IDS must contain at least one user ID")
+        return cls(
+            bot_token=bot_token,
+            storage_channel_id=storage_channel_id,
+            operator_user_ids=operators,
+            database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
+            refresh_delay_seconds=_integer("REFRESH_DELAY_SECONDS", 10, positive=True),
+            max_channels_per_user=_integer("MAX_CHANNELS_PER_USER", 10, positive=True),
+            max_drafts_per_user=_integer("MAX_DRAFTS_PER_USER", 50, positive=True),
+            max_slots_per_channel=_integer("MAX_SLOTS_PER_CHANNEL", 10, positive=True),
+            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            conversation_timeout_seconds=_integer("CONVERSATION_TIMEOUT_SECONDS", 900, positive=True),
+            pending_draft_ttl_seconds=_integer("PENDING_DRAFT_TTL_SECONDS", 600, positive=True),
+            pending_cleanup_interval_seconds=_integer("PENDING_CLEANUP_INTERVAL_SECONDS", 60, positive=True),
+        )
+
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterable
+
+import aiosqlite
+
+
+MIGRATION_1 = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS channels (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    username TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    silent INTEGER NOT NULL DEFAULT 1,
+    refresh_delay_seconds INTEGER NOT NULL DEFAULT 10,
+    status TEXT NOT NULL DEFAULT 'active',
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS channel_managers (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    bound_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, channel_id)
+);
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    current_revision_id INTEGER,
+    deleted_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS draft_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    revision_number INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (draft_id, revision_number)
+);
+CREATE TABLE IF NOT EXISTS content_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    text TEXT,
+    storage_message_id INTEGER,
+    media_kind TEXT,
+    grouped_id TEXT,
+    formatting_entities_json TEXT NOT NULL DEFAULT '[]',
+    UNIQUE (revision_id, position)
+);
+CREATE TABLE IF NOT EXISTS draft_buttons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
+    row_number INTEGER NOT NULL,
+    column_number INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    url TEXT NOT NULL,
+    UNIQUE (revision_id, row_number, column_number)
+);
+CREATE TABLE IF NOT EXISTS channel_slots (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    slot_number INTEGER NOT NULL,
+    revision_id INTEGER NOT NULL REFERENCES draft_revisions(id),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_by INTEGER NOT NULL REFERENCES users(id),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel_id, slot_number)
+);
+CREATE TABLE IF NOT EXISTS sent_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS sent_messages (
+    batch_id INTEGER NOT NULL REFERENCES sent_batches(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS orphan_messages (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS refresh_jobs (
+    channel_id INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+    due_at REAL NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL,
+    last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS conversation_states (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    state TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+    actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    action TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_owner ON drafts(owner_user_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_revisions_draft ON draft_revisions(draft_id, revision_number);
+CREATE INDEX IF NOT EXISTS idx_batches_current ON sent_batches(channel_id, is_current);
+CREATE INDEX IF NOT EXISTS idx_audit_channel ON audit_logs(channel_id, created_at);
+"""
+
+MIGRATION_2 = """
+CREATE TABLE IF NOT EXISTS collected_storage_messages (
+    message_id INTEGER PRIMARY KEY,
+    collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+MIGRATION_3 = """
+ALTER TABLE content_items ADD COLUMN telegram_file_id TEXT;
+"""
+
+MIGRATION_4 = (
+    """
+    CREATE TABLE pending_drafts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        expires_at REAL NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE pending_draft_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pending_draft_id INTEGER NOT NULL REFERENCES pending_drafts(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        text TEXT,
+        storage_message_id INTEGER,
+        media_kind TEXT,
+        telegram_file_id TEXT,
+        grouped_id TEXT,
+        formatting_entities_json TEXT NOT NULL DEFAULT '[]',
+        UNIQUE (pending_draft_id, position)
+    )
+    """,
+    "ALTER TABLE channel_slots ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE channel_slots ADD COLUMN name_customized INTEGER NOT NULL DEFAULT 0",
+    """
+    UPDATE channel_slots AS slot
+    SET display_name = COALESCE(
+        (
+            SELECT draft.name
+            FROM draft_revisions AS revision
+            JOIN drafts AS draft ON draft.id = revision.draft_id
+            WHERE revision.id = slot.revision_id
+        ),
+        printf('置底帖子 %d', slot.slot_number)
+    )
+    """,
+    "CREATE INDEX idx_pending_drafts_status_expires_at ON pending_drafts(status, expires_at)",
+)
+
+
+class Database:
+    def __init__(self, connection: aiosqlite.Connection) -> None:
+        self.connection = connection
+        self._lock = asyncio.Lock()
+
+    @classmethod
+    async def open(cls, path: Path) -> "Database":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = await aiosqlite.connect(path)
+        connection.row_factory = aiosqlite.Row
+        database = cls(connection)
+        await database._configure()
+        await database._migrate()
+        return database
+
+    async def _configure(self) -> None:
+        await self.connection.execute("PRAGMA foreign_keys = ON")
+        await self.connection.execute("PRAGMA journal_mode = WAL")
+        await self.connection.execute("PRAGMA busy_timeout = 5000")
+        await self.connection.commit()
+
+    async def _migrate(self) -> None:
+        async with self._lock:
+            await self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+            row = await (await self.connection.execute("SELECT MAX(version) AS version FROM schema_migrations")).fetchone()
+            version = int(row["version"] or 0)
+            try:
+                if version < 1:
+                    await self.connection.executescript(MIGRATION_1)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (1)")
+                if version < 2:
+                    await self.connection.executescript(MIGRATION_2)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (2)")
+                if version < 3:
+                    await self.connection.executescript(MIGRATION_3)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (3)")
+                await self.connection.commit()
+                if version < 4:
+                    await self.connection.execute("BEGIN IMMEDIATE")
+                    for statement in MIGRATION_4:
+                        await self.connection.execute(statement)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (4)")
+                await self.connection.commit()
+            except Exception:
+                await self.connection.rollback()
+                raise
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        async with self._lock:
+            try:
+                await self.connection.execute("BEGIN IMMEDIATE")
+                yield self.connection
+                await self.connection.commit()
+            except Exception:
+                await self.connection.rollback()
+                raise
+
+    async def execute(self, sql: str, parameters: Iterable[Any] = ()) -> None:
+        async with self._lock:
+            await self.connection.execute(sql, tuple(parameters))
+            await self.connection.commit()
+
+    async def fetch_one(self, sql: str, parameters: Iterable[Any] = ()) -> aiosqlite.Row | None:
+        async with self._lock:
+            cursor = await self.connection.execute(sql, tuple(parameters))
+            try:
+                return await cursor.fetchone()
+            finally:
+                await cursor.close()
+
+    async def fetch_all(self, sql: str, parameters: Iterable[Any] = ()) -> list[aiosqlite.Row]:
+        async with self._lock:
+            cursor = await self.connection.execute(sql, tuple(parameters))
+            try:
+                return list(await cursor.fetchall())
+            finally:
+                await cursor.close()
+
+    async def fetch_value(self, sql: str, parameters: Iterable[Any] = ()) -> Any:
+        row = await self.fetch_one(sql, parameters)
+        return None if row is None else row[0]
+
+    async def close(self) -> None:
+        await self.connection.close()
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Iterable
+from urllib.parse import urlsplit
+
+
+class ValidationError(ValueError):
+    """Raised when user-provided domain data is invalid."""
+
+
+class ContentKind(StrEnum):
+    TEXT = "text"
+    MEDIA = "media"
+
+
+@dataclass(frozen=True, slots=True)
+class ContentItem:
+    text: str | None = None
+    storage_message_id: int | None = None
+    media_kind: str | None = None
+    telegram_file_id: str | None = None
+    grouped_id: str | None = None
+    formatting_entities_json: str = "[]"
+
+    def __post_init__(self) -> None:
+        if not (self.text or self.storage_message_id or self.telegram_file_id):
+            raise ValidationError("content item requires text or stored media")
+
+
+@dataclass(frozen=True, slots=True)
+class ButtonSpec:
+    text: str
+    url: str
+    row: int
+    column: int
+
+    def __post_init__(self) -> None:
+        if not self.text.strip():
+            raise ValidationError("button text cannot be empty")
+        if self.row < 0 or self.column < 0:
+            raise ValidationError("button position cannot be negative")
+        if urlsplit(self.url).scheme.lower() not in {"https", "http", "tg"}:
+            raise ValidationError("button URL must use https://, http:// or tg://")
+
+
+@dataclass(frozen=True, slots=True)
+class DraftRevision:
+    id: int
+    revision_number: int
+    items: tuple[ContentItem, ...]
+    buttons: tuple[ButtonSpec, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not self.items:
+            raise ValidationError("draft revision cannot be empty")
+        if len(self.buttons) > 100:
+            raise ValidationError("a message can contain at most 100 buttons")
+        row_counts: dict[int, int] = {}
+        positions: set[tuple[int, int]] = set()
+        for button in self.buttons:
+            position = (button.row, button.column)
+            if position in positions:
+                raise ValidationError("button positions must be unique")
+            positions.add(position)
+            row_counts[button.row] = row_counts.get(button.row, 0) + 1
+        if any(count > 8 for count in row_counts.values()):
+            raise ValidationError("a button row can contain at most 8 buttons")
+
+
+@dataclass(frozen=True, slots=True)
+class Draft:
+    id: int
+    owner_user_id: int
+    name: str
+    current_revision: DraftRevision
+
+
+@dataclass(frozen=True, slots=True)
+class SlotSnapshot:
+    channel_id: int
+    slot_number: int
+    revision: DraftRevision
+    enabled: bool = True
+    display_name: str = ""
+    name_customized: bool = False
+
+    def __post_init__(self) -> None:
+        if self.slot_number <= 0:
+            raise ValidationError("slot number must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDraft:
+    id: int
+    user_id: int
+    items: tuple[ContentItem, ...]
+    expires_at: float
+    status: str = "pending"
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshJob:
+    channel_id: int
+    due_at: float
+    generation: int
+    attempts: int
+    reason: str
+    last_error: str | None = None
+
+
+def enabled_slots_in_publish_order(slots: Iterable[SlotSnapshot]) -> list[SlotSnapshot]:
+    return sorted((slot for slot in slots if slot.enabled and slot.revision.items), key=lambda slot: slot.slot_number, reverse=True)
+
+TELEGRAM_BOT_TOKEN=123456:replace_with_bot_token
+STORAGE_CHANNEL_ID=-1001234567890
+OPERATOR_USER_IDS=123456789
+
+DATABASE_PATH=data/bot.sqlite3
+REFRESH_DELAY_SECONDS=10
+MAX_CHANNELS_PER_USER=10
+MAX_DRAFTS_PER_USER=50
+MAX_SLOTS_PER_CHANNEL=10
+CONVERSATION_TIMEOUT_SECONDS=900
+PENDING_DRAFT_TTL_SECONDS=600
+PENDING_CLEANUP_INTERVAL_SECONDS=60
+LOG_LEVEL=INFO
+
+import os
+import unittest
+from unittest.mock import patch
+
+from bottom_post_bot.config import ConfigurationError, Settings
+
+
+class SettingsTests(unittest.TestCase):
+    def test_loads_required_values_and_defaults(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "123:token",
+            "STORAGE_CHANNEL_ID": "-1001234567890",
+            "OPERATOR_USER_IDS": "7, 8",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.bot_token, "123:token")
+        self.assertEqual(settings.storage_channel_id, -1001234567890)
+        self.assertEqual(settings.operator_user_ids, frozenset({7, 8}))
+        self.assertEqual(settings.refresh_delay_seconds, 10)
+        self.assertEqual(settings.max_channels_per_user, 10)
+        self.assertEqual(settings.max_drafts_per_user, 50)
+        self.assertEqual(settings.max_slots_per_channel, 10)
+        self.assertEqual(settings.pending_draft_ttl_seconds, 600)
+        self.assertEqual(settings.pending_cleanup_interval_seconds, 60)
+
+    def test_rejects_missing_required_value(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "TELEGRAM_BOT_TOKEN"):
+                Settings.from_env()
+
+    def test_rejects_non_positive_limits(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "STORAGE_CHANNEL_ID": "-1001",
+            "OPERATOR_USER_IDS": "7",
+            "MAX_SLOTS_PER_CHANNEL": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "MAX_SLOTS_PER_CHANNEL"):
+                Settings.from_env()
+
+    def test_rejects_non_positive_pending_draft_settings(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "STORAGE_CHANNEL_ID": "-1001",
+            "OPERATOR_USER_IDS": "7",
+            "PENDING_DRAFT_TTL_SECONDS": "0",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ConfigurationError, "PENDING_DRAFT_TTL_SECONDS"):
+                Settings.from_env()
+
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+import aiosqlite
+
+from bottom_post_bot import database
+from bottom_post_bot.database import Database
+from bottom_post_bot.domain import ButtonSpec, ContentItem
+from bottom_post_bot.repositories import Repository, ResourceLimitError
+
+
+class DatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db = await Database.open(Path(self.tempdir.name) / "test.sqlite3")
+        self.repo = Repository(self.db)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        self.tempdir.cleanup()
+
+    async def test_migration_enables_foreign_keys_and_wal(self) -> None:
+        foreign_keys = await self.db.fetch_value("PRAGMA foreign_keys")
+        journal_mode = await self.db.fetch_value("PRAGMA journal_mode")
+        version = await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations")
+        self.assertEqual(foreign_keys, 1)
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertEqual(version, 4)
+
+    async def test_migration_four_backfills_slot_names_from_existing_drafts(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy.sqlite3"
+        self._create_version_three_database(database_path)
+
+        self.db = await Database.open(database_path)
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 4)
+        slot = await self.db.fetch_one(
+            "SELECT display_name, name_customized FROM channel_slots WHERE channel_id=? AND slot_number=?",
+            (-1009, 1),
+        )
+        self.assertEqual(dict(slot), {"display_name": "Existing draft", "name_customized": 0})
+        self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='pending_drafts'"))
+
+    async def test_migration_four_rolls_back_every_statement_when_one_fails(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy.sqlite3"
+        self._create_version_three_database(database_path)
+        connection = await aiosqlite.connect(database_path)
+        connection.row_factory = aiosqlite.Row
+        self.db = Database(connection)
+        await self.db._configure()
+
+        original_migration = database.MIGRATION_4
+        database.MIGRATION_4 = (*original_migration[:-1], "THIS IS NOT VALID SQL")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                await self.db._migrate()
+        finally:
+            database.MIGRATION_4 = original_migration
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 3)
+        self.assertIsNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='pending_drafts'"))
+        columns = await self.db.fetch_all("PRAGMA table_info(channel_slots)")
+        self.assertNotIn("display_name", {column["name"] for column in columns})
+        self.assertNotIn("name_customized", {column["name"] for column in columns})
+
+    async def test_personal_drafts_are_isolated_by_owner(self) -> None:
+        await self.repo.upsert_user(1, "Alice")
+        await self.repo.upsert_user(2, "Bob")
+        draft = await self.repo.create_draft(
+            owner_user_id=1,
+            name="广告",
+            items=(ContentItem(text="hello"),),
+            buttons=(ButtonSpec("网站", "https://example.com", 0, 0),),
+            max_drafts=50,
+        )
+        self.assertIsNotNone(await self.repo.get_draft(1, draft.id))
+        self.assertIsNone(await self.repo.get_draft(2, draft.id))
+
+    async def test_draft_quota_is_enforced(self) -> None:
+        await self.repo.upsert_user(1, "Alice")
+        await self.repo.create_draft(1, "one", (ContentItem(text="one"),), (), max_drafts=1)
+        with self.assertRaises(ResourceLimitError):
+            await self.repo.create_draft(1, "two", (ContentItem(text="two"),), (), max_drafts=1)
+
+    async def test_slot_keeps_revision_snapshot_when_draft_changes(self) -> None:
+        await self.repo.upsert_user(1, "Alice")
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        await self.repo.bind_manager(1, -1009, max_channels=10)
+        draft = await self.repo.create_draft(1, "ad", (ContentItem(text="old"),), (), max_drafts=50)
+        await self.repo.assign_slot(-1009, 1, draft.current_revision.id, actor_id=1, max_slots=10)
+        await self.repo.create_revision(draft.id, 1, (ContentItem(text="new"),), ())
+
+        slots, _, _ = await self.repo.load_publish_state(-1009)
+
+        self.assertEqual(slots[0].revision.items[0].text, "old")
+
+    async def test_recovery_turns_incomplete_batch_into_cleanup_and_refresh_work(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        batch_id = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_messages(batch_id, [301, 302])
+
+        recovered = await self.repo.recover_incomplete_batches(now=123.0)
+        slots, cleanup_ids, _ = await self.repo.load_publish_state(-1009)
+        job = await self.repo.get_refresh_job(-1009)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(slots, [])
+        self.assertEqual(cleanup_ids, [301, 302])
+        self.assertEqual(job.due_at, 123.0)
+
+    async def test_disabled_channel_still_returns_old_messages_for_cleanup(self) -> None:
+        await self.repo.upsert_user(1, "Alice")
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        await self.repo.bind_manager(1, -1009, max_channels=10)
+        await self.repo.commit_batch(-1009, [401])
+        await self.repo.set_channel_options(-1009, 1, enabled=False)
+
+        slots, cleanup_ids, _ = await self.repo.load_publish_state(-1009)
+
+        self.assertEqual(slots, [])
+        self.assertEqual(cleanup_ids, [401])
+
+    async def test_storage_media_is_collectable_only_after_all_live_references_are_removed(self) -> None:
+        await self.repo.upsert_user(1, "Alice")
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        await self.repo.bind_manager(1, -1009, max_channels=10)
+        draft = await self.repo.create_draft(
+            1,
+            "media",
+            (ContentItem(storage_message_id=701, media_kind="photo", telegram_file_id="photo-file"),),
+            (),
+            max_drafts=50,
+        )
+        await self.repo.assign_slot(-1009, 1, draft.current_revision.id, 1, max_slots=10)
+        await self.repo.delete_draft(1, draft.id)
+        self.assertEqual(await self.repo.list_collectable_storage_ids(), [])
+
+        await self.repo.clear_slot(-1009, 1, 1)
+        self.assertEqual(await self.repo.list_collectable_storage_ids(), [701])
+
+    async def test_message_in_sending_batch_is_ignored_by_channel_listener(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        batch_id = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_messages(batch_id, [888])
+        self.assertTrue(await self.repo.is_current_sent_message(-1009, 888))
+
+    @staticmethod
+    def _create_version_three_database(database_path: Path) -> None:
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(database.MIGRATION_1)
+            connection.executescript(database.MIGRATION_2)
+            connection.executescript(database.MIGRATION_3)
+            connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+            connection.executemany("INSERT INTO schema_migrations(version) VALUES (?)", [(1,), (2,), (3,)])
+            connection.execute("INSERT INTO users(id, display_name) VALUES (?, ?)", (1, "Alice"))
+            connection.execute("INSERT INTO channels(id, title) VALUES (?, ?)", (-1009, "Channel"))
+            cursor = connection.execute("INSERT INTO drafts(owner_user_id, name) VALUES (?, ?)", (1, "Existing draft"))
+            draft_id = cursor.lastrowid
+            cursor = connection.execute(
+                "INSERT INTO draft_revisions(draft_id, revision_number) VALUES (?, ?)",
+                (draft_id, 1),
+            )
+            connection.execute(
+                "INSERT INTO channel_slots(channel_id, slot_number, revision_id, updated_by) VALUES (?, ?, ?, ?)",
+                (-1009, 1, cursor.lastrowid, 1),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+import unittest
+
+from bottom_post_bot import domain
+from bottom_post_bot.domain import (
+    ButtonSpec,
+    ContentItem,
+    DraftRevision,
+    SlotSnapshot,
+    ValidationError,
+    enabled_slots_in_publish_order,
+)
+
+
+class ButtonSpecTests(unittest.TestCase):
+    def test_accepts_supported_url_schemes(self) -> None:
+        for url in ("https://example.com", "http://example.com", "tg://resolve?domain=x"):
+            self.assertEqual(ButtonSpec("打开", url, row=0, column=0).url, url)
+
+    def test_rejects_unsafe_url_scheme(self) -> None:
+        with self.assertRaises(ValidationError):
+            ButtonSpec("危险", "javascript:alert(1)", row=0, column=0)
+
+    def test_rejects_more_than_eight_buttons_in_a_row(self) -> None:
+        buttons = tuple(ButtonSpec(str(i), f"https://example.com/{i}", 0, i) for i in range(9))
+        with self.assertRaisesRegex(ValidationError, "8"):
+            DraftRevision(1, 1, (ContentItem(text="hello"),), buttons)
+
+
+class SlotOrderingTests(unittest.TestCase):
+    def test_slot_can_store_a_custom_display_name(self) -> None:
+        revision = DraftRevision(1, 1, (ContentItem(text="post"),))
+        slot = SlotSnapshot(-1001, 2, revision, True, "活动入口", True)
+
+        self.assertEqual((slot.display_name, slot.name_customized), ("活动入口", True))
+
+    def test_enabled_non_empty_slots_publish_from_high_to_low(self) -> None:
+        revision = DraftRevision(1, 1, (ContentItem(text="hello"),), ())
+        slots = [
+            SlotSnapshot(1, 1, revision, enabled=True),
+            SlotSnapshot(1, 3, revision, enabled=True),
+            SlotSnapshot(1, 2, revision, enabled=False),
+        ]
+        ordered = enabled_slots_in_publish_order(slots)
+        self.assertEqual([slot.slot_number for slot in ordered], [3, 1])
+
+
+class PendingDraftTests(unittest.TestCase):
+    def test_defaults_to_pending_status(self) -> None:
+        pending_draft = domain.PendingDraft(1, 7, (ContentItem(text="post"),), 123.0)
+
+        self.assertEqual(pending_draft.status, "pending")

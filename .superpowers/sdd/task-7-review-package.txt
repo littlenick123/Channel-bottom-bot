@@ -1,0 +1,573 @@
+# Task 7 — Restart-Safe Pending Cleanup
+
+## Status
+
+Implemented.
+
+## Changes
+
+- Added `PendingCleanupLoop`, which cleans immediately, logs and survives individual cleanup failures, waits by the configured interval, and exits when stopped.
+- Started the loop as the `pending-cleanup` task with `Settings.pending_cleanup_interval_seconds`.
+- Shutdown now flushes albums, signals both background loops, cancels only unfinished tasks, awaits them with `return_exceptions=True`, then closes the bot session and database.
+- Added restart persistence coverage for confirming a pending draft through a reopened database.
+
+## TDD evidence
+
+- RED: `python -m pytest tests/test_maintenance.py tests/test_pending_drafts.py -q` failed during collection because `bottom_post_bot.maintenance` did not exist.
+- RED: the app-lifecycle test failed with a timeout before the application created the pending-cleanup task.
+- GREEN: `python -m pytest tests/test_maintenance.py tests/test_pending_drafts.py -q` — `9 passed in 3.00s`.
+- Full verification: `python -m pytest -q` — `110 passed in 8.24s`.
+
+## Commit
+
+Not created: the workspace is not a Git repository, and the parent task explicitly requested no commit.
+
+## Concerns
+
+None.
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from .pending_drafts import PendingDraftService
+
+
+logger = logging.getLogger(__name__)
+
+
+class PendingCleanupLoop:
+    def __init__(self, service: PendingDraftService, interval_seconds: int | float) -> None:
+        self.service = service
+        self.interval_seconds = interval_seconds
+        self._stop = asyncio.Event()
+
+    async def run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self.service.cleanup_expired(time.time())
+            except Exception:
+                logger.exception("Failed to clean expired pending drafts")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.interval_seconds)
+            except TimeoutError:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import time
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.types import BotCommand
+
+from .aiogram_gateway import BotApiGateway, BotApiPermissionGateway
+from .channels import ChannelService
+from .config import ConfigurationError, Settings
+from .database import Database
+from .drafts import DraftService
+from .handlers import BotHandlers
+from .listeners import ChannelListener
+from .maintenance import PendingCleanupLoop
+from .membership import ChatMembershipService
+from .notifications import TelegramAdminNotifier
+from .pending_drafts import PendingDraftService
+from .permissions import PermissionService
+from .publisher import Publisher
+from .repositories import Repository
+from .scheduler import RefreshScheduler
+
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def build_router(handlers: BotHandlers, listener: ChannelListener, membership: ChatMembershipService) -> Router:
+    router = Router(name="bottom-post-bot")
+    router.message.register(handlers.on_private_message, F.chat.type == ChatType.PRIVATE)
+    router.callback_query.register(handlers.on_callback)
+    router.channel_post.register(listener.handle)
+    router.my_chat_member.register(membership.handle)
+    return router
+
+
+async def run(settings: Settings) -> None:
+    settings.database_path.parent.mkdir(parents=True, exist_ok=True)
+    database = await Database.open(settings.database_path)
+    bot = Bot(token=settings.bot_token)
+    dispatcher = Dispatcher()
+    scheduler_task: asyncio.Task | None = None
+    cleanup_task: asyncio.Task | None = None
+    scheduler: RefreshScheduler | None = None
+    cleanup_loop: PendingCleanupLoop | None = None
+    handlers: BotHandlers | None = None
+    try:
+        await bot.get_chat(settings.storage_channel_id)
+        repository = Repository(database)
+        recovered_batches = await repository.recover_incomplete_batches(time.time())
+        if recovered_batches:
+            logger.warning("Recovered interrupted publish batches", extra={"count": recovered_batches})
+
+        telegram = BotApiGateway(bot, settings.storage_channel_id)
+        permission_gateway = BotApiPermissionGateway(bot)
+        permissions = PermissionService(repository, permission_gateway)
+        drafts = DraftService(repository, telegram, settings.max_drafts_per_user)
+        pending_drafts = PendingDraftService(
+            repository,
+            telegram,
+            settings.max_drafts_per_user,
+            settings.pending_draft_ttl_seconds,
+        )
+        channels = ChannelService(
+            repository,
+            permissions,
+            max_channels=settings.max_channels_per_user,
+            max_slots=settings.max_slots_per_channel,
+            default_refresh_delay=settings.refresh_delay_seconds,
+        )
+        publisher = Publisher(telegram, repository)
+        notifier = TelegramAdminNotifier(bot, repository, permission_gateway)
+        scheduler = RefreshScheduler(repository, publisher, notifier=notifier)
+        cleanup_loop = PendingCleanupLoop(pending_drafts, settings.pending_cleanup_interval_seconds)
+        handlers = BotHandlers(bot, repository, drafts, channels, permissions, scheduler, telegram, settings, pending_drafts)
+        listener = ChannelListener(repository, scheduler)
+        membership = ChatMembershipService(repository, channels, notifier, storage_channel_id=settings.storage_channel_id)
+        router = build_router(handlers, listener, membership)
+        dispatcher.include_router(router)
+
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="打开管理菜单"),
+                BotCommand(command="status", description="查看个人状态"),
+                BotCommand(command="cancel", description="取消当前操作"),
+                BotCommand(command="help", description="查看使用帮助"),
+            ]
+        )
+        scheduler_task = asyncio.create_task(scheduler.run_forever(), name="refresh-scheduler")
+        cleanup_task = asyncio.create_task(cleanup_loop.run_forever(), name="pending-cleanup")
+        me = await bot.get_me()
+        logger.info("Bot started", extra={"bot_id": me.id})
+        await dispatcher.start_polling(
+            bot,
+            allowed_updates=dispatcher.resolve_used_update_types(),
+            polling_timeout=30,
+            tasks_concurrency_limit=100,
+            close_bot_session=False,
+        )
+    finally:
+        if handlers is not None:
+            await handlers.flush_albums()
+        if cleanup_loop is not None:
+            cleanup_loop.stop()
+        if scheduler is not None:
+            scheduler.stop()
+        tasks = [task for task in (cleanup_task, scheduler_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await bot.session.close()
+        await database.close()
+
+
+def main() -> None:
+    try:
+        settings = Settings.from_env()
+    except ConfigurationError as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc
+    configure_logging(settings.log_level)
+    asyncio.run(run(settings))
+
+
+if __name__ == "__main__":
+    main()
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Callable, Sequence
+
+from .domain import ContentItem, Draft, PendingDraft
+from .drafts import IncomingContent, StorageGateway, default_draft_name
+from .repositories import AuthorizationError, Repository
+
+
+logger = logging.getLogger(__name__)
+
+
+class PendingDraftService:
+    def __init__(
+        self,
+        repository: Repository,
+        storage: StorageGateway,
+        max_drafts: int,
+        ttl_seconds: int,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.repository = repository
+        self.storage = storage
+        self.max_drafts = max_drafts
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+
+    async def prepare(self, user_id: int, messages: Sequence[IncomingContent]) -> PendingDraft:
+        if not messages:
+            raise ValueError("at least one message is required")
+        storage_ids = await self.storage.copy_messages(messages)
+        try:
+            if len(storage_ids) != len(messages):
+                raise RuntimeError("storage gateway returned an unexpected number of messages")
+            items = tuple(
+                ContentItem(
+                    text=message.text,
+                    storage_message_id=storage_id,
+                    media_kind=message.media_kind,
+                    telegram_file_id=message.file_id,
+                    grouped_id=message.grouped_id,
+                    formatting_entities_json=message.formatting_entities_json,
+                )
+                for message, storage_id in zip(messages, storage_ids, strict=True)
+            )
+            return await self.repository.create_pending_draft(user_id, items, self.clock() + self.ttl_seconds)
+        except Exception:
+            try:
+                await self.storage.delete_storage_messages(storage_ids)
+            except Exception:
+                logger.exception("Failed to compensate copied pending-draft messages")
+            raise
+
+    async def confirm(self, pending_id: int, user_id: int, name: str | None = None) -> Draft:
+        pending = await self.assert_confirmable(pending_id, user_id)
+        draft_name = (name or default_draft_name(pending.items)).strip()[:100] or "未命名草稿"
+        return await self.repository.confirm_pending_draft(
+            user_id, pending_id, draft_name, self.max_drafts, now=self.clock()
+        )
+
+    async def assert_confirmable(self, pending_id: int, user_id: int) -> PendingDraft:
+        pending = await self.repository.get_pending_draft(user_id, pending_id)
+        if pending is None or pending.status != "pending" or pending.expires_at <= self.clock():
+            raise AuthorizationError("pending draft already processed or expired")
+        return pending
+
+    async def discard(self, pending_id: int, user_id: int) -> bool:
+        pending = await self.repository.get_pending_draft(user_id, pending_id)
+        if pending is None:
+            return False
+        if not await self.repository.mark_pending_discarded(user_id, pending_id, now=self.clock()):
+            return False
+        await self.storage.delete_storage_messages(
+            [item.storage_message_id for item in pending.items if item.storage_message_id is not None]
+        )
+        return True
+
+    async def cleanup_expired(self, now: float, limit: int = 100) -> int:
+        cleaned = 0
+        for pending in await self.repository.list_pending_cleanup(now, limit):
+            try:
+                await self.storage.delete_storage_messages(
+                    [item.storage_message_id for item in pending.items if item.storage_message_id is not None]
+                )
+            except Exception:
+                logger.exception("Failed to delete pending-draft storage messages", extra={"pending_draft_id": pending.id})
+                continue
+            if await self.repository.complete_pending_cleanup(pending.id):
+                cleaned += 1
+        return cleaned
+
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from bottom_post_bot import app
+from bottom_post_bot.config import Settings
+from bottom_post_bot.maintenance import PendingCleanupLoop
+
+
+class FakePendingDraftService:
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.calls: list[float] = []
+        self.first_call = asyncio.Event()
+        self.second_call = asyncio.Event()
+
+    async def cleanup_expired(self, now: float) -> int:
+        self.calls.append(now)
+        self.first_call.set()
+        if len(self.calls) == 2:
+            self.second_call.set()
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("temporary cleanup failure")
+        return 0
+
+
+class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runs_cleanup_immediately_and_stops(self) -> None:
+        service = FakePendingDraftService()
+        loop = PendingCleanupLoop(service, interval_seconds=60)
+        task = asyncio.create_task(loop.run_forever())
+
+        await asyncio.wait_for(service.first_call.wait(), timeout=0.5)
+        loop.stop()
+        await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(len(service.calls), 1)
+
+    async def test_logs_cleanup_exception_and_continues(self) -> None:
+        service = FakePendingDraftService(failures=1)
+        loop = PendingCleanupLoop(service, interval_seconds=0.01)
+
+        with self.assertLogs("bottom_post_bot.maintenance", level="ERROR"):
+            task = asyncio.create_task(loop.run_forever())
+            await asyncio.wait_for(service.second_call.wait(), timeout=0.5)
+            loop.stop()
+            await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(len(service.calls), 2)
+
+    async def test_app_stops_pending_cleanup_before_closing_database(self) -> None:
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        cleanup_instances = []
+
+        class FakeDatabase:
+            closed_after_cleanup = False
+
+            async def close(self) -> None:
+                self.closed_after_cleanup = cleanup_finished.is_set()
+
+        class FakeBot:
+            def __init__(self, token: str) -> None:
+                self.session = SimpleNamespace(close=AsyncMock())
+
+            async def get_chat(self, chat_id: int) -> None:
+                return None
+
+            async def set_my_commands(self, commands) -> None:
+                return None
+
+            async def get_me(self):
+                return SimpleNamespace(id=1)
+
+        class FakeDispatcher:
+            def include_router(self, router) -> None:
+                return None
+
+            def resolve_used_update_types(self) -> list[str]:
+                return []
+
+            async def start_polling(self, *args, **kwargs) -> None:
+                await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+
+        class FakeRepository:
+            def __init__(self, database) -> None:
+                return None
+
+            async def recover_incomplete_batches(self, now: float) -> int:
+                return 0
+
+        class FakeScheduler:
+            def __init__(self, *args, **kwargs) -> None:
+                self._stop = asyncio.Event()
+
+            async def run_forever(self) -> None:
+                await self._stop.wait()
+
+            def stop(self) -> None:
+                self._stop.set()
+
+        class FakeCleanupLoop:
+            def __init__(self, service, interval_seconds: int) -> None:
+                self.service = service
+                self.interval_seconds = interval_seconds
+                self._stop = asyncio.Event()
+                cleanup_instances.append(self)
+
+            async def run_forever(self) -> None:
+                cleanup_started.set()
+                try:
+                    await self._stop.wait()
+                finally:
+                    cleanup_finished.set()
+
+            def stop(self) -> None:
+                self._stop.set()
+
+        database = FakeDatabase()
+        with tempfile.TemporaryDirectory() as tempdir:
+            settings = Settings(
+                bot_token="token",
+                storage_channel_id=-1001,
+                operator_user_ids=frozenset({1}),
+                database_path=Path(tempdir) / "bot.sqlite3",
+                pending_cleanup_interval_seconds=17,
+            )
+            with (
+                patch.object(app.Database, "open", new=AsyncMock(return_value=database)),
+                patch.object(app, "Bot", FakeBot),
+                patch.object(app, "Dispatcher", FakeDispatcher),
+                patch.object(app, "Repository", FakeRepository),
+                patch.object(app, "RefreshScheduler", FakeScheduler),
+                patch.object(app, "PendingCleanupLoop", FakeCleanupLoop, create=True),
+            ):
+                await app.run(settings)
+
+        self.assertEqual(len(cleanup_instances), 1)
+        self.assertEqual(cleanup_instances[0].interval_seconds, 17)
+        self.assertTrue(database.closed_after_cleanup)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from bottom_post_bot.database import Database
+from bottom_post_bot.drafts import IncomingContent
+from bottom_post_bot.pending_drafts import PendingDraftService
+from bottom_post_bot.repositories import Repository
+
+
+class FakeStorage:
+    def __init__(self) -> None:
+        self.copy_calls: list[tuple[IncomingContent, ...]] = []
+        self.deleted_ids: list[list[int]] = []
+        self.delete_error: Exception | None = None
+
+    async def copy_messages(self, messages):
+        self.copy_calls.append(tuple(messages))
+        return [700 + index for index, _ in enumerate(messages)]
+
+    async def delete_storage_messages(self, message_ids):
+        self.deleted_ids.append(list(message_ids))
+        if self.delete_error:
+            raise self.delete_error
+
+
+class PendingDraftServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db = await Database.open(Path(self.tempdir.name) / "test.sqlite3")
+        self.repo = Repository(self.db)
+        await self.repo.upsert_user(1, "Alice")
+        self.storage = FakeStorage()
+        self.service = PendingDraftService(self.repo, self.storage, max_drafts=50, ttl_seconds=60, clock=lambda: 100.0)
+
+    async def asyncTearDown(self) -> None:
+        await self.db.close()
+        self.tempdir.cleanup()
+
+    async def test_prepare_copies_once_and_confirm_uses_content_summary(self) -> None:
+        pending = await self.service.prepare(
+            1,
+            [
+                IncomingContent(10, 1, "  album\n title  ", "photo", "group", "[]"),
+                IncomingContent(10, 2, None, "photo", "group", "[]"),
+            ],
+        )
+
+        draft = await self.service.confirm(pending.id, 1)
+
+        self.assertEqual(len(self.storage.copy_calls), 1)
+        self.assertEqual(draft.name, "album title")
+        self.assertEqual([item.storage_message_id for item in draft.current_revision.items], [700, 701])
+
+    async def test_discard_marks_then_deletes_storage_items(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "discard", None, None, "[]")])
+
+        discarded = await self.service.discard(pending.id, 1)
+
+        self.assertTrue(discarded)
+        self.assertEqual(self.storage.deleted_ids, [[700]])
+        cleanup = await self.repo.list_pending_cleanup(now=100.0)
+        self.assertEqual([item.id for item in cleanup], [pending.id])
+
+    async def test_discard_rejects_expired_pending_without_deleting_storage_items(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "expired", None, None, "[]")])
+        self.service.clock = lambda: 160.0
+
+        discarded = await self.service.discard(pending.id, 1)
+
+        self.assertFalse(discarded)
+        self.assertEqual(self.storage.deleted_ids, [])
+        row = await self.db.fetch_one("SELECT status FROM pending_drafts WHERE id=?", (pending.id,))
+        self.assertEqual(row["status"], "pending")
+
+    async def test_expired_cleanup_retries_terminal_rows(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "expired", None, None, "[]")])
+
+        cleaned = await self.service.cleanup_expired(now=160.0)
+
+        self.assertEqual(cleaned, 1)
+        self.assertEqual(self.storage.deleted_ids, [[700]])
+        self.assertIsNone(await self.repo.get_pending_draft(1, pending.id))
+
+    async def test_cleanup_keeps_terminal_row_when_deletion_fails_for_retry(self) -> None:
+        pending = await self.service.prepare(1, [IncomingContent(10, 1, "retry", None, None, "[]")])
+        self.storage.delete_error = RuntimeError("temporary deletion failure")
+
+        cleaned = await self.service.cleanup_expired(now=160.0)
+
+        self.assertEqual(cleaned, 0)
+        row = await self.db.fetch_one("SELECT status FROM pending_drafts WHERE id=?", (pending.id,))
+        self.assertEqual(row["status"], "expired")
+        self.storage.delete_error = None
+        self.assertEqual(await self.service.cleanup_expired(now=161.0), 1)
+        self.assertEqual(self.storage.deleted_ids, [[700], [700]])
+
+    async def test_pending_draft_can_be_confirmed_after_database_reopen_before_expiry(self) -> None:
+        database_path = Path(self.tempdir.name) / "restart.sqlite3"
+        first_database = await Database.open(database_path)
+        first_repository = Repository(first_database)
+        await first_repository.upsert_user(1, "Alice")
+        first_service = PendingDraftService(
+            first_repository,
+            FakeStorage(),
+            max_drafts=50,
+            ttl_seconds=60,
+            clock=lambda: 100.0,
+        )
+        pending = await first_service.prepare(1, [IncomingContent(10, 1, "restart", None, None, "[]")])
+        await first_database.close()
+
+        second_database = await Database.open(database_path)
+        try:
+            second_service = PendingDraftService(
+                Repository(second_database),
+                FakeStorage(),
+                max_drafts=50,
+                ttl_seconds=60,
+                clock=lambda: 159.0,
+            )
+
+            draft = await second_service.confirm(pending.id, 1)
+        finally:
+            await second_database.close()
+
+        self.assertEqual(draft.name, "restart")
+
+
+if __name__ == "__main__":
+    unittest.main()
