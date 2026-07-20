@@ -125,3 +125,14 @@ class RefreshJob:
 
 def enabled_slots_in_publish_order(slots: Iterable[SlotSnapshot]) -> list[SlotSnapshot]:
     return sorted((slot for slot in slots if slot.enabled and slot.revision.items), key=lambda slot: slot.slot_number, reverse=True)
+
+
+def group_content_items(items: Iterable[ContentItem]) -> list[list[ContentItem]]:
+    """Keep adjacent items from the same Telegram media group together."""
+    groups: list[list[ContentItem]] = []
+    for item in items:
+        if item.grouped_id and groups and groups[-1][0].grouped_id == item.grouped_id:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups

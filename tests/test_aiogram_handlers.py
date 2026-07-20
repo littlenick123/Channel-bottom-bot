@@ -92,12 +92,22 @@ class FakeGateway:
     def __init__(self) -> None:
         self.preview_calls = []
         self.preview_error = None
+        self.send_calls = []
+        self.send_group_calls = []
 
     async def preview_storage_messages(self, user_id, message_ids):
         self.preview_calls.append((user_id, list(message_ids)))
         if self.preview_error:
             raise self.preview_error
         return [900 + index for index, _ in enumerate(message_ids)]
+
+    async def send_content(self, chat_id, item, buttons, silent):
+        self.send_calls.append((chat_id, item, tuple(buttons), silent))
+        return [900 + len(self.send_calls)]
+
+    async def send_content_group(self, chat_id, items, buttons, silent):
+        self.send_group_calls.append((chat_id, tuple(items), tuple(buttons), silent))
+        return [900 + index for index, _ in enumerate(items)]
 
 
 class FakeMessage(SimpleNamespace):
@@ -285,6 +295,43 @@ class PendingDraftConfirmationHandlerTests(unittest.IsolatedAsyncioTestCase):
             "操作失败：暂时无法确认频道管理员权限，请稍后重试",
         )
         self.assertNotIn("TelegramForbiddenError", message.answers[-1][0])
+
+
+class DraftPreviewHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saved_album_preview_is_sent_as_one_media_group(self) -> None:
+        album_items = (
+            ContentItem(text="相册说明", telegram_file_id="photo-1", media_kind="photo", grouped_id="album-1"),
+            ContentItem(telegram_file_id="photo-2", media_kind="photo", grouped_id="album-1"),
+        )
+        repository = FakeRepository()
+        repository.get_draft = AsyncMock(
+            return_value=Draft(11, 42, "相册草稿", DraftRevision(12, 1, album_items))
+        )
+        gateway = FakeGateway()
+        settings = SimpleNamespace(
+            conversation_timeout_seconds=900,
+            max_drafts_per_user=50,
+            max_slots_per_channel=10,
+            operator_user_ids=frozenset(),
+        )
+        handlers = BotHandlers(
+            SimpleNamespace(),
+            repository,
+            FakeDraftService(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(),
+            gateway,
+            settings,
+            pending_drafts=FakePendingDrafts(),
+        )
+        event = SimpleNamespace(answer=AsyncMock())
+
+        await handlers._preview_draft(event, 42, 11)
+
+        self.assertEqual(gateway.send_calls, [])
+        self.assertEqual(gateway.send_group_calls, [(42, album_items, (), True)])
+        event.answer.assert_awaited_once_with("预览已发送", show_alert=True)
 
 
 class BatchButtonHandlerTests(unittest.IsolatedAsyncioTestCase):

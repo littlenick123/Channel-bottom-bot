@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .config import Settings
-from .domain import ButtonSpec, ContentItem, DraftRevision
+from .domain import ButtonSpec, ContentItem, DraftRevision, group_content_items
 from .drafts import DraftService, IncomingContent
 from .pending_drafts import PendingDraftService
 from .permissions import PermissionDenied, PermissionService, PermissionUnavailable
@@ -519,9 +519,13 @@ class BotHandlers:
         draft = await self.repository.get_draft(user_id, draft_id)
         if not draft:
             raise PermissionDenied("草稿不存在")
-        for index, item in enumerate(draft.current_revision.items):
-            buttons = draft.current_revision.buttons if index == len(draft.current_revision.items) - 1 else ()
-            await self.gateway.send_content(user_id, item, buttons, silent=True)
+        groups = group_content_items(draft.current_revision.items)
+        for index, items in enumerate(groups):
+            buttons = draft.current_revision.buttons if index == len(groups) - 1 else ()
+            if len(items) > 1 and items[0].grouped_id:
+                await self.gateway.send_content_group(user_id, items, buttons, silent=True)
+            else:
+                await self.gateway.send_content(user_id, items[0], buttons, silent=True)
         await event.answer("预览已发送", show_alert=True)
 
     async def _show_channels(self, event, user_id: int) -> None:

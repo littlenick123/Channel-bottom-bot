@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Protocol, Sequence
 
-from .domain import ButtonSpec, ContentItem, SlotSnapshot, enabled_slots_in_publish_order
+from .domain import ButtonSpec, ContentItem, SlotSnapshot, enabled_slots_in_publish_order, group_content_items
 
 
 class RefreshOutcome(StrEnum):
@@ -79,7 +79,7 @@ class Publisher:
             if previous_ids:
                 await self._gateway.delete_messages(channel_id, previous_ids)
             for slot in ordered:
-                groups = self._content_groups(slot.revision.items)
+                groups = group_content_items(slot.revision.items)
                 for index, items in enumerate(groups):
                     buttons = slot.revision.buttons if index == len(groups) - 1 else ()
                     if len(items) > 1 and items[0].grouped_id:
@@ -105,13 +105,3 @@ class Publisher:
 
         await self._state.finalize_batch(channel_id, batch_id)
         return RefreshOutcome.SUCCESS
-
-    @staticmethod
-    def _content_groups(items: Sequence[ContentItem]) -> list[list[ContentItem]]:
-        groups: list[list[ContentItem]] = []
-        for item in items:
-            if item.grouped_id and groups and groups[-1][0].grouped_id == item.grouped_id:
-                groups[-1].append(item)
-            else:
-                groups.append([item])
-        return groups
