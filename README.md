@@ -81,6 +81,59 @@ docker compose logs -f bottom-post-bot
 
 数据库位于 `./data`。Compose 已配置最多五个、每个 10 MB 的日志文件。
 
+### Docker 常见启动错误
+
+先查看容器状态和最近日志：
+
+```bash
+docker compose ps
+docker compose logs --tail=100 bottom-post-bot
+```
+
+#### `project name must not be empty`
+
+Compose 默认使用项目目录名生成项目名。目录名全部为中文等非 ASCII 字符时，过滤后可能得到空名称。当前 `docker-compose.yml` 已通过顶层 `name: bottom-post-bot` 固定项目名；旧版本也可以临时显式指定：
+
+```bash
+docker compose -p bottom-post-bot up -d --build
+```
+
+#### `sqlite3.OperationalError: unable to open database file`
+
+项目使用 `./data:/app/data` 保存数据库。Linux 上如果 `data` 由 root 创建，容器内 UID `10001` 的 `botuser` 将无法写入。仅创建目录并不够，还需要修正所有权和权限：
+
+```bash
+mkdir -p data
+chown -R 10001:10001 data
+chmod 750 data
+docker compose up -d --build --force-recreate
+```
+
+同时确认 `.env` 中的数据库路径位于挂载目录：
+
+```env
+DATABASE_PATH=data/bot.sqlite3
+```
+
+#### `Bad Request: chat not found`
+
+这表示机器人无法访问 `STORAGE_CHANNEL_ID` 指定的草稿存储频道。请确认：
+
+- 已创建专用私密存储频道；
+- 已将机器人添加为该频道管理员，并授予发布和删除消息权限；
+- `.env` 中填写的是真实频道 ID，而不是 `.env.example` 的示例值；
+- 频道 ID 使用完整的 `-100...` 格式。
+
+检查配置并让容器重新载入 `.env`：
+
+```bash
+grep '^STORAGE_CHANNEL_ID=' .env
+docker compose up -d --force-recreate
+docker compose logs --tail=100 -f bottom-post-bot
+```
+
+修改 `.env` 不需要重新构建镜像，但必须重新创建容器；单纯执行 `docker compose restart` 不会重新载入环境文件。
+
 ## 使用流程
 
 - `/start`：打开主菜单。
