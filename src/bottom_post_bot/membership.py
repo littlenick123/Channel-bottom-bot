@@ -109,7 +109,7 @@ class ChatMembershipService:
                         await self.repository.pause_channel(channel_id, "bot lacks required channel capabilities")
             return
 
-        if self.analytics is not None:
+        if self.analytics is not None and getattr(self.channels, "analytics", None) is None:
             await self.analytics.initialize_channel(channel_id, getattr(event, "date", datetime.now(UTC)))
         if created:
             await self.repository.audit(channel_id, actor.id, "channel.auto_bind", {})

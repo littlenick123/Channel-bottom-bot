@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -119,6 +120,7 @@ class RefreshScheduler:
 
 
 DAILY_REPORT_RETRY_SECONDS = (60, 300, 900, 3600)
+logger = logging.getLogger(__name__)
 
 
 class DailyStatsScheduler:
@@ -302,9 +304,14 @@ class DailyStatsScheduler:
         self._startup_stop.clear()
         if await self._startup_waiter(self._startup_stop, 60) or self._stopping:
             return
-        await self.repository.recover_stuck_daily_report_deliveries(self.clock())
         while not self._stopping:
-            await self.run_due_once()
+            try:
+                await self.repository.recover_stuck_daily_report_deliveries(self.clock())
+                await self.run_due_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Daily statistics scheduler cycle failed")
             if self._stopping:
                 break
             self._wake.clear()

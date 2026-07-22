@@ -92,7 +92,6 @@ class AnalyticsService:
     ) -> bool:
         if self._timestamp(ended_at) - self._timestamp(started_at) <= RUNTIME_GAP_SECONDS:
             return False
-        dates = self._intersected_dates(started_at, ended_at)
         for channel_id in await self.repository.list_stats_managed_channel_ids():
             state = await self.repository.get_analytics_state(channel_id)
             if state is None:

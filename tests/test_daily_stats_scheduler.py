@@ -235,6 +235,38 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await task
         scheduler.repository.recover_stuck_daily_report_deliveries.assert_not_awaited()
 
+    async def test_run_forever_logs_a_recovery_failure_and_runs_the_next_cycle(self) -> None:
+        async def startup_elapsed(stop_event, seconds):
+            return False
+
+        scheduler = DailyStatsScheduler(
+            self.repo,
+            self.analytics,
+            self.permissions,
+            self.delivery,
+            timezone="Asia/Shanghai",
+            push_time=time(0, 5),
+            startup_waiter=startup_elapsed,
+        )
+        scheduler.repository.recover_stuck_daily_report_deliveries = AsyncMock(side_effect=[RuntimeError("database unavailable"), 0])
+
+        async def stop_after_second_cycle():
+            scheduler.stop()
+
+        scheduler.run_due_once = AsyncMock(side_effect=stop_after_second_cycle)
+
+        async def elapsed_wait(awaitable, *, timeout):
+            awaitable.close()
+            raise TimeoutError
+
+        with self.assertLogs("bottom_post_bot.scheduler", level="ERROR"), patch(
+            "bottom_post_bot.scheduler.asyncio.wait_for", new=AsyncMock(side_effect=elapsed_wait)
+        ):
+            await scheduler.run_forever()
+
+        self.assertEqual(scheduler.repository.recover_stuck_daily_report_deliveries.await_count, 2)
+        scheduler.run_due_once.assert_awaited_once()
+
     async def test_wake_and_stop_signal_scheduler_event(self) -> None:
         self.scheduler._wake.clear()
         self.scheduler.wake()

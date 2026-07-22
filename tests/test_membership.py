@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from aiogram import Dispatcher
+from aiogram.types import Update
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import GetMe
@@ -418,7 +419,7 @@ class TelegramAdminNotifierTests(unittest.IsolatedAsyncioTestCase):
                 await database.close()
 
 
-class AppRegistrationTests(unittest.TestCase):
+class AppRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def test_member_observers_are_included_in_allowed_updates(self) -> None:
         async def handle(*args):
             return None
@@ -435,6 +436,43 @@ class AppRegistrationTests(unittest.TestCase):
 
         self.assertIn("my_chat_member", dispatcher.resolve_used_update_types())
         self.assertIn("chat_member", dispatcher.resolve_used_update_types())
+
+    async def test_supergroup_message_is_routed_to_the_generalized_listener(self) -> None:
+        calls = []
+
+        async def private_handler(*args):
+            calls.append("private")
+
+        async def listener_handler(message):
+            calls.append((message.chat.type, message.text))
+
+        async def membership_handler(*args):
+            return None
+
+        dispatcher = Dispatcher()
+        dispatcher.include_router(
+            build_router(
+                SimpleNamespace(on_private_message=private_handler, on_callback=private_handler),
+                SimpleNamespace(handle=listener_handler),
+                SimpleNamespace(handle=membership_handler),
+            )
+        )
+        update = Update.model_validate(
+            {
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "date": 0,
+                    "text": "hello group",
+                    "chat": {"id": -1007, "type": "supergroup", "title": "Group"},
+                    "from": {"id": 7, "is_bot": False, "first_name": "Alice"},
+                },
+            }
+        )
+
+        await dispatcher.feed_update(SimpleNamespace(id=1), update)
+
+        self.assertEqual(calls, [(ChatType.SUPERGROUP, "hello group")])
 
 
 class MemberUpdateAdapterTests(unittest.IsolatedAsyncioTestCase):

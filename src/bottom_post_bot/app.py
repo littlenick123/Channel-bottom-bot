@@ -76,8 +76,8 @@ async def drain_dispatcher_update_tasks(dispatcher: Dispatcher) -> None:
 async def run(settings: Settings) -> None:
     settings.database_path.parent.mkdir(parents=True, exist_ok=True)
     database = await Database.open(settings.database_path)
-    bot = Bot(token=settings.bot_token)
-    dispatcher = Dispatcher()
+    bot = None
+    dispatcher = None
     scheduler_task: asyncio.Task | None = None
     cleanup_task: asyncio.Task | None = None
     daily_stats_task: asyncio.Task | None = None
@@ -86,6 +86,8 @@ async def run(settings: Settings) -> None:
     daily_stats_scheduler: DailyStatsScheduler | None = None
     handlers: BotHandlers | None = None
     try:
+        bot = Bot(token=settings.bot_token)
+        dispatcher = Dispatcher()
         await bot.get_chat(settings.storage_channel_id)
         me = await bot.get_me()
         repository = Repository(database)
@@ -111,6 +113,7 @@ async def run(settings: Settings) -> None:
             max_slots=settings.max_slots_per_channel,
             storage_channel_id=settings.storage_channel_id,
             default_refresh_delay=settings.refresh_delay_seconds,
+            analytics=analytics,
         )
         publisher = Publisher(telegram, repository)
         notifier = TelegramAdminNotifier(bot, repository, permission_gateway)
@@ -159,23 +162,29 @@ async def run(settings: Settings) -> None:
             close_bot_session=False,
         )
     finally:
-        await drain_dispatcher_update_tasks(dispatcher)
-        if handlers is not None:
-            await handlers.flush_albums()
-        if cleanup_loop is not None:
-            cleanup_loop.stop()
-        if scheduler is not None:
-            scheduler.stop()
-        if daily_stats_scheduler is not None:
-            daily_stats_scheduler.stop()
-        tasks = [task for task in (daily_stats_task, cleanup_task, scheduler_task) if task is not None]
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        await bot.session.close()
-        await database.close()
+        try:
+            if dispatcher is not None:
+                await drain_dispatcher_update_tasks(dispatcher)
+            if handlers is not None:
+                await handlers.flush_albums()
+        finally:
+            if cleanup_loop is not None:
+                cleanup_loop.stop()
+            if scheduler is not None:
+                scheduler.stop()
+            if daily_stats_scheduler is not None:
+                daily_stats_scheduler.stop()
+            tasks = [task for task in (daily_stats_task, cleanup_task, scheduler_task) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                if bot is not None:
+                    await bot.session.close()
+            finally:
+                await database.close()
 
 
 def main() -> None:

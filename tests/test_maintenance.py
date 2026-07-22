@@ -319,6 +319,46 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("bottom_post_bot.app", level="ERROR"):
             await app.drain_dispatcher_update_tasks(dispatcher)
 
+    async def test_app_closes_open_database_when_bot_or_dispatcher_construction_fails(self) -> None:
+        events: list[str] = []
+
+        class FakeDatabase:
+            async def close(self) -> None:
+                events.append("database-closed")
+
+        class BotConstructorFailure:
+            def __init__(self, token: str) -> None:
+                raise RuntimeError("bot construction failed")
+
+        database = FakeDatabase()
+        settings = Settings("token", -1001, frozenset({1}), Path(tempfile.gettempdir()) / "bot.sqlite3")
+        with (
+            patch.object(app.Database, "open", new=AsyncMock(return_value=database)),
+            patch.object(app, "Bot", BotConstructorFailure),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bot construction failed"):
+                await app.run(settings)
+        self.assertEqual(events, ["database-closed"])
+
+        events.clear()
+
+        class FakeBot:
+            def __init__(self, token: str) -> None:
+                self.session = SimpleNamespace(close=AsyncMock(side_effect=lambda: events.append("session-closed")))
+
+        class DispatcherConstructorFailure:
+            def __init__(self) -> None:
+                raise RuntimeError("dispatcher construction failed")
+
+        with (
+            patch.object(app.Database, "open", new=AsyncMock(return_value=database)),
+            patch.object(app, "Bot", FakeBot),
+            patch.object(app, "Dispatcher", DispatcherConstructorFailure),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "dispatcher construction failed"):
+                await app.run(settings)
+        self.assertEqual(events, ["session-closed", "database-closed"])
+
     async def test_app_wires_daily_stats_with_resolved_bot_identity_and_cleans_it_up_after_polling_error(self) -> None:
         """The analytics loop shares the application's startup and shutdown contract."""
         lifecycle: list[object] = []

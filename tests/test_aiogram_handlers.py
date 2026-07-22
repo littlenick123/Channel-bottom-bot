@@ -4,6 +4,7 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from bottom_post_bot.channels import ChannelIdentity
 from bottom_post_bot.domain import ContentItem, DailyMemberStats, Draft, DraftRevision, MemberStatsReport, PendingDraft, SlotSnapshot
 from bottom_post_bot.handlers import BotHandlers, message_to_incoming
 from bottom_post_bot.permissions import PermissionDenied, PermissionUnavailable
@@ -296,6 +297,19 @@ class PendingDraftConfirmationHandlerTests(unittest.IsolatedAsyncioTestCase):
             "操作失败：暂时无法确认频道或超级群组的管理员权限，请稍后重试",
         )
         self.assertNotIn("TelegramForbiddenError", message.answers[-1][0])
+
+    async def test_manual_supergroup_binding_reports_an_unavailable_member_baseline_without_losing_the_binding(self) -> None:
+        self.repository.conversations[42] = ("await_channel", {})
+        self.handlers.channels = SimpleNamespace(
+            bind=AsyncMock(return_value=ChannelIdentity(-1007, "Group", "group", "supergroup", False))
+        )
+        message = forwarded_message(text="-1007")
+
+        await self.handlers.on_private_message(message)
+
+        self.assertIn("已绑定超级群组：Group", message.answers[-1][0])
+        self.assertIn("成员总数暂时无法获取", message.answers[-1][0])
+        self.assertEqual(self.repository.cleared, [42])
 
 
 class DraftPreviewHandlerTests(unittest.IsolatedAsyncioTestCase):

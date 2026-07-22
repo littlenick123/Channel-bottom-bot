@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = """频道置底机器人
 
 1. 把机器人加入频道或超级群组并授予发送、删除消息权限。
-2. 在“我的频道”绑定公开用户名、频道/超级群组 ID，或转发其中的帖子。
+2. 在“我的频道/群组”绑定公开用户名、频道/超级群组 ID，或转发其中的帖子。
 3. 转发帖子给机器人保存为个人草稿，可配置 URL 按钮。
 4. 把草稿发布到编号槽位；机器人按大编号到小编号发送，1 号位于最底部。
 5. 使用 /stats 查询成员统计，并在统计页开关自己的每日推送。
@@ -262,11 +262,11 @@ class BotHandlers:
             await event.answer("操作失败，请稍后重试", show_alert=True)
 
     async def show_main(self, event: Message | CallbackQuery) -> None:
-        await self._show(event, "置底机器人管理中心\n\n草稿属于个人；频道配置由已绑定的当前频道管理员共享。", self._main_buttons())
+        await self._show(event, "置底机器人管理中心\n\n草稿属于个人；频道/超级群组配置由已绑定的当前管理员共享。", self._main_buttons())
 
     @staticmethod
     def _main_buttons():
-        return [[_cb("📝 我的草稿", "d"), _cb("📣 我的频道", "c")], [_cb("ℹ️ 使用帮助", "h")]]
+        return [[_cb("📝 我的草稿", "d"), _cb("📣 我的频道/群组", "c")], [_cb("ℹ️ 使用帮助", "h")]]
 
     @staticmethod
     def _pending_buttons(pending_id: int):
@@ -339,11 +339,11 @@ class BotHandlers:
             channel_id = int(channel_id)
             await self.permissions.assert_user_can_manage(user_id, channel_id)
             if not await self.repository.set_manager_stats_push_enabled(user_id, channel_id, enabled == "1"):
-                raise AuthorizationError("频道绑定已失效")
+                raise AuthorizationError("频道/超级群组绑定已失效")
             await self._show_stats_chat(event, user_id, channel_id)
         elif data == "c:bind":
             await self._set_state(user_id, "await_channel", {})
-            await self._show(event, "请发送频道 @username、-100 开头的 ID，或转发一条频道帖子。")
+            await self._show(event, "请发送频道/超级群组 @username、-100 开头的 ID，或转发其中的一条帖子。")
         elif data.startswith("c:view:"):
             await self._show_channel(event, user_id, int(data.rsplit(":", 1)[1]))
         elif data.startswith("c:stats:"):
@@ -413,7 +413,7 @@ class BotHandlers:
             await self._show_channels(event, user_id)
         elif data.startswith("c:leave:"):
             channel_id = int(data.rsplit(":", 1)[1])
-            await self._show(event, "退出后你将看不到该频道配置，其他管理员不受影响。", [[_cb("确认退出", f"c:leave_confirm:{channel_id}"), _cb("取消", f"c:view:{channel_id}")]])
+            await self._show(event, "退出后你将看不到该频道/超级群组配置，其他管理员不受影响。", [[_cb("确认退出", f"c:leave_confirm:{channel_id}"), _cb("取消", f"c:view:{channel_id}")]])
         elif data.startswith("c:delete_confirm:"):
             channel_id = int(data.rsplit(":", 1)[1])
             await self.permissions.assert_user_can_manage(user_id, channel_id)
@@ -470,7 +470,16 @@ class BotHandlers:
         elif state == "await_channel":
             channel = await self.channels.bind(user_id, self._channel_reference(message))
             await self.repository.clear_conversation(user_id)
-            await message.answer(f"已绑定频道：{channel.title}", reply_markup=_markup([[_cb("打开频道配置", f"c:view:{channel.id}")]]))
+            label = "超级群组" if channel.chat_type == "supergroup" else "频道"
+            baseline_note = (
+                "\n成员总数暂时无法获取；绑定已保存，统计起始日会标记为不完整，稍后会自动更新。"
+                if channel.stats_baseline_available is False
+                else ""
+            )
+            await message.answer(
+                f"已绑定{label}：{channel.title}{baseline_note}",
+                reply_markup=_markup([[_cb("打开频道/群组配置", f"c:view:{channel.id}")]]),
+            )
         elif state == "await_slot_name":
             if not 1 <= len(text) <= 100:
                 raise ValueError("槽位名称长度必须为 1 到 100 个字符")
@@ -483,13 +492,13 @@ class BotHandlers:
             channel_id = int(payload["channel_id"])
             await self.channels.update_options(channel_id, user_id, refresh_delay_seconds=delay)
             await self.repository.clear_conversation(user_id)
-            await message.answer("刷新延迟已更新。", reply_markup=_markup([[_cb("返回频道", f"c:view:{channel_id}")]]))
+            await message.answer("刷新延迟已更新。", reply_markup=_markup([[_cb("返回频道/群组", f"c:view:{channel_id}")]]))
         elif state == "await_move_slot":
             channel_id = int(payload["channel_id"])
             await self.channels.move_slot(channel_id, int(payload["source"]), int(text), user_id)
             await self.repository.clear_conversation(user_id)
             await self.scheduler.request(channel_id, "slot-move", 0)
-            await message.answer("槽位编号已调整。", reply_markup=_markup([[_cb("返回频道", f"c:view:{channel_id}")]]))
+            await message.answer("槽位编号已调整。", reply_markup=_markup([[_cb("返回频道/群组", f"c:view:{channel_id}")]]))
 
     async def _capture(self, message: Message, user_id: int, messages: Sequence[Message]) -> None:
         pending = await self.pending_drafts.prepare(user_id, [message_to_incoming(item) for item in messages])
@@ -517,7 +526,7 @@ class BotHandlers:
         chat = getattr(origin, "chat", None) or getattr(message, "forward_from_chat", None)
         if chat is not None:
             return int(chat.id)
-        raise ValueError("无法识别频道，请发送 @username 或 -100 开头的频道 ID")
+        raise ValueError("无法识别频道/超级群组，请发送 @username 或 -100 开头的 ID")
 
     async def _show_drafts(self, event, user_id: int) -> None:
         drafts = await self.repository.list_drafts(user_id)
@@ -554,8 +563,8 @@ class BotHandlers:
     async def _show_channels(self, event, user_id: int) -> None:
         channels = await self.repository.list_user_channels(user_id)
         rows = [[_cb(f"📣 {row['title'][:30]}", f"c:view:{row['id']}")] for row in channels]
-        rows.extend([[_cb("➕ 绑定频道", "c:bind")], [_cb("返回", "m")]])
-        await self._show(event, f"我的频道（{len(channels)}/{self.settings.max_channels_per_user}）", rows)
+        rows.extend([[_cb("➕ 绑定频道/群组", "c:bind")], [_cb("返回", "m")]])
+        await self._show(event, f"我的频道/群组（{len(channels)}/{self.settings.max_channels_per_user}）", rows)
 
     def _stats_timezone(self) -> ZoneInfo:
         return ZoneInfo(getattr(self.settings, "stats_timezone", "Asia/Shanghai"))
@@ -583,17 +592,19 @@ class BotHandlers:
         await self._show(
             event,
             format_chat_report(report, timezone=self._stats_timezone()),
-            [[_cb(label, f"s:t:{channel_id}:{toggle_to}")], [_cb("返回统计列表", "s"), _cb("返回频道", f"c:view:{channel_id}")]],
+            [[_cb(label, f"s:t:{channel_id}:{toggle_to}")], [_cb("返回统计列表", "s"), _cb("返回频道/群组", f"c:view:{channel_id}")]],
         )
 
     async def _show_channel(self, event, user_id: int, channel_id: int) -> None:
         await self.permissions.assert_user_can_manage(user_id, channel_id)
         channel = await self.repository.get_channel(channel_id)
         if not channel:
-            raise PermissionDenied("频道配置不存在")
+            raise PermissionDenied("频道/超级群组配置不存在")
         slots = await self.repository.list_channel_slots(channel_id)
         slot_map = {slot.slot_number: slot for slot in slots}
-        lines = [f"频道：{channel['title']}", f"状态：{channel['status']}", f"总开关：{'开启' if channel['enabled'] else '关闭'}", f"发送：{'静默' if channel['silent'] else '通知'}", f"合并延迟：{channel['refresh_delay_seconds']} 秒", "槽位（发送顺序为大号→1号）："]
+        chat_type = channel["chat_type"] if "chat_type" in channel.keys() else "channel"
+        chat_label = "超级群组" if chat_type == "supergroup" else "频道"
+        lines = [f"{chat_label}：{channel['title']}", f"状态：{channel['status']}", f"总开关：{'开启' if channel['enabled'] else '关闭'}", f"发送：{'静默' if channel['silent'] else '通知'}", f"合并延迟：{channel['refresh_delay_seconds']} 秒", "槽位（发送顺序为大号→1号）："]
         for number in range(1, self.settings.max_slots_per_channel + 1):
             slot = slot_map.get(number)
             if slot:
@@ -619,20 +630,20 @@ class BotHandlers:
         rows.append([_cb("成员统计", f"c:stats:{channel_id}")])
         if channel["status"] == "paused":
             rows.append([_cb("检查权限并恢复", f"c:resume:{channel_id}")])
-        rows.extend([[_cb("退出管理", f"c:leave:{channel_id}"), _cb("删除共享配置", f"c:delete:{channel_id}")], [_cb("返回频道列表", "c")]])
+        rows.extend([[_cb("退出管理", f"c:leave:{channel_id}"), _cb("删除共享配置", f"c:delete:{channel_id}")], [_cb("返回频道/群组列表", "c")]])
         await self._show(event, "\n".join(lines), rows)
 
     async def _choose_draft(self, event, user_id: int, channel_id: int, slot: int) -> None:
         await self.permissions.assert_user_can_manage(user_id, channel_id)
         drafts = await self.repository.list_drafts(user_id)
         rows = [[_cb(draft.name[:30], f"a:{channel_id}:{slot}:{draft.id}")] for draft in drafts]
-        rows.append([_cb("返回频道", f"c:view:{channel_id}")])
+        rows.append([_cb("返回频道/群组", f"c:view:{channel_id}")])
         await self._show(event, f"选择发布到 {slot} 号槽位的个人草稿：", rows)
 
     async def show_status(self, message: Message, user_id: int) -> None:
         drafts = await self.repository.list_drafts(user_id)
         channels = await self.repository.list_user_channels(user_id)
-        await message.answer(f"个人状态\n草稿：{len(drafts)}\n已绑定频道：{len(channels)}")
+        await message.answer(f"个人状态\n草稿：{len(drafts)}\n已绑定频道/超级群组：{len(channels)}")
 
     async def show_health(self, message: Message, user_id: int) -> None:
         if user_id not in self.settings.operator_user_ids:

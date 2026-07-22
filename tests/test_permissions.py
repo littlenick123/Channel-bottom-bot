@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 from bottom_post_bot.channels import ChannelIdentity, ChannelService
+from bottom_post_bot.analytics import AnalyticsService
 from bottom_post_bot.database import Database
 from bottom_post_bot.domain import ContentItem
 from bottom_post_bot.permissions import BotCapabilities, PermissionDenied, PermissionService, PermissionUnavailable
@@ -25,6 +27,11 @@ class FakePermissionGateway:
 
     async def bot_capabilities(self, channel_id: int) -> BotCapabilities:
         return BotCapabilities(is_admin=self.bot_ok, can_send=self.bot_ok, can_delete=self.bot_ok)
+
+
+class FailingMemberCountGateway:
+    async def get_member_count(self, channel_id: int) -> int:
+        raise RuntimeError("temporary Telegram outage")
 
 
 class PermissionServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -78,6 +85,26 @@ class PermissionServiceTests(unittest.IsolatedAsyncioTestCase):
         await channel.bind(1, "@news")
         stored = await self.repo.get_channel(-1007)
         self.assertEqual(stored["refresh_delay_seconds"], 17)
+
+    async def test_manual_binding_initializes_incomplete_stats_when_member_count_baseline_is_unavailable(self) -> None:
+        analytics = AnalyticsService(self.repo, FailingMemberCountGateway(), "Asia/Shanghai")
+        channels = ChannelService(
+            self.repo,
+            PermissionService(self.repo, FakePermissionGateway()),
+            max_channels=10,
+            max_slots=10,
+            storage_channel_id=-10050,
+            analytics=analytics,
+        )
+
+        bound = await channels.bind(1, "@news")
+
+        self.assertFalse(bound.stats_baseline_available)
+        self.assertTrue(await self.repo.is_bound_manager(1, -1007))
+        self.assertIsNotNone(await self.repo.get_analytics_state(-1007))
+        daily = await self.repo.get_daily_member_stats(-1007, analytics.local_date(datetime.now(UTC)))
+        self.assertIsNotNone(daily)
+        self.assertFalse(daily.is_complete)
 
     async def test_assign_slot_accepts_only_owned_draft(self) -> None:
         await self.repo.upsert_user(2, "Bob")

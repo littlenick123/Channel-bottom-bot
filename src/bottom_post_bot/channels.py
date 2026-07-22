@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 import logging
+from typing import TYPE_CHECKING
 
 from aiogram.exceptions import TelegramAPIError
 
 from .permissions import PermissionDenied, PermissionService
 from .repositories import Repository
+
+if TYPE_CHECKING:
+    from .analytics import AnalyticsService
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +27,7 @@ class ChannelIdentity:
     title: str
     username: str | None
     chat_type: str = "channel"
+    stats_baseline_available: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +46,7 @@ class ChannelService:
         max_slots: int,
         storage_channel_id: int,
         default_refresh_delay: int = 10,
+        analytics: "AnalyticsService | None" = None,
     ) -> None:
         self.repository = repository
         self.permissions = permissions
@@ -47,6 +54,7 @@ class ChannelService:
         self.max_slots = max_slots
         self.storage_channel_id = storage_channel_id
         self.default_refresh_delay = default_refresh_delay
+        self.analytics = analytics
 
     async def bind(self, user_id: int, reference: str | int) -> ChannelIdentity:
         channel, _ = await self.bind_with_result(user_id, reference)
@@ -68,6 +76,11 @@ class ChannelService:
         created = await self.repository.bind_manager(user_id, channel.id, self.max_channels)
         if created:
             await self.repository.audit(channel.id, user_id, "channel.bind", {})
+        if self.analytics is not None:
+            activated_at = datetime.now(UTC)
+            await self.analytics.initialize_channel(channel.id, activated_at)
+            baseline = await self.analytics.refresh_current_count(channel.id, activated_at)
+            channel = replace(channel, stats_baseline_available=baseline is not None)
         return channel, created
 
     async def reconcile_managed_chats(self) -> ReconciledChats:
