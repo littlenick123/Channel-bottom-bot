@@ -93,6 +93,9 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
             async def recover_incomplete_batches(self, now: float) -> int:
                 return 0
 
+            async def list_managed_channels(self):
+                return []
+
         class FakeScheduler:
             def __init__(self, *args, **kwargs) -> None:
                 self._stop = asyncio.Event()
@@ -211,6 +214,9 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
 
             async def recover_incomplete_batches(self, now: float) -> int:
                 return 0
+
+            async def list_managed_channels(self):
+                return []
 
         class FakeLoop:
             def __init__(self, *args, **kwargs) -> None:

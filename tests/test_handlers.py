@@ -114,6 +114,16 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
         await listener.handle(message)
         self.assertEqual(scheduler.calls, [(-1007, "channel-message:22", 10)])
 
+    async def test_schedules_external_supergroup_message_but_filters_bot_and_service_messages(self) -> None:
+        scheduler = FakeScheduler()
+        listener = ChannelListener(FakeRepository(), scheduler)
+        base = dict(chat=SimpleNamespace(id=-1007), message_id=22)
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=False)))
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=True)))
+        await listener.handle(SimpleNamespace(**base, new_chat_members=[SimpleNamespace(id=1)]))
+
+        self.assertEqual(scheduler.calls, [(-1007, "channel-message:22", 10)])
+
 
 if __name__ == "__main__":
     unittest.main()

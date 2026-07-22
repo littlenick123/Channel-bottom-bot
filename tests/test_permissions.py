@@ -23,7 +23,7 @@ class FakePermissionGateway:
         return self.user_admin
 
     async def bot_capabilities(self, channel_id: int) -> BotCapabilities:
-        return BotCapabilities(is_admin=self.bot_ok, can_post=self.bot_ok, can_delete=self.bot_ok)
+        return BotCapabilities(is_admin=self.bot_ok, can_send=self.bot_ok, can_delete=self.bot_ok)
 
 
 class PermissionServiceTests(unittest.IsolatedAsyncioTestCase):

@@ -10,6 +10,7 @@ from aiogram.enums import ChatType
 from aiogram.types import BotCommand
 
 from .aiogram_gateway import BotApiGateway, BotApiPermissionGateway
+from .analytics import AnalyticsService, MemberUpdateAdapter
 from .channels import ChannelService
 from .config import ConfigurationError, Settings
 from .database import Database
@@ -37,12 +38,17 @@ def configure_logging(level: str) -> None:
     )
 
 
-def build_router(handlers: BotHandlers, listener: ChannelListener, membership: ChatMembershipService) -> Router:
+def build_router(
+    handlers: BotHandlers, listener: ChannelListener, membership: ChatMembershipService, member_updates: MemberUpdateAdapter | None = None
+) -> Router:
     router = Router(name="bottom-post-bot")
     router.message.register(handlers.on_private_message, F.chat.type == ChatType.PRIVATE)
     router.callback_query.register(handlers.on_callback)
     router.channel_post.register(listener.handle)
+    router.message.register(listener.handle, F.chat.type == ChatType.SUPERGROUP)
     router.my_chat_member.register(membership.handle)
+    if member_updates is not None:
+        router.chat_member.register(member_updates.handle)
     return router
 
 
@@ -83,6 +89,7 @@ async def run(settings: Settings) -> None:
             logger.warning("Recovered interrupted publish batches", extra={"count": recovered_batches})
 
         telegram = BotApiGateway(bot, settings.storage_channel_id)
+        analytics = AnalyticsService(repository, telegram, settings.stats_timezone)
         permission_gateway = BotApiPermissionGateway(bot)
         permissions = PermissionService(repository, permission_gateway)
         drafts = DraftService(repository, telegram, settings.max_drafts_per_user)
@@ -106,8 +113,11 @@ async def run(settings: Settings) -> None:
         cleanup_loop = PendingCleanupLoop(pending_drafts, settings.pending_cleanup_interval_seconds)
         handlers = BotHandlers(bot, repository, drafts, channels, permissions, scheduler, telegram, settings, pending_drafts)
         listener = ChannelListener(repository, scheduler)
-        membership = ChatMembershipService(repository, channels, notifier, storage_channel_id=settings.storage_channel_id)
-        router = build_router(handlers, listener, membership)
+        membership = ChatMembershipService(
+            repository, channels, notifier, storage_channel_id=settings.storage_channel_id, analytics=analytics
+        )
+        await membership.reconcile_managed_chats()
+        router = build_router(handlers, listener, membership, MemberUpdateAdapter(analytics))
         dispatcher.include_router(router)
 
         await bot.set_my_commands(

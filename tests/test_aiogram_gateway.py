@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import GetMe
 
 from bottom_post_bot.aiogram_gateway import BotApiGateway, BotApiPermissionGateway
@@ -21,6 +21,9 @@ class FakeBot:
         self.copy_error = None
         self.user_member_status = "administrator"
         self.user_member_error: Exception | None = None
+        self.chat_type = "channel"
+        self.member_count = 42
+        self.member_count_error: Exception | None = None
 
     async def copy_messages(self, **kwargs):
         self.copy_calls.append(kwargs)
@@ -45,7 +48,7 @@ class FakeBot:
         return True
 
     async def get_chat(self, reference):
-        return SimpleNamespace(id=-1007, title="News", username="news", type="channel")
+        return SimpleNamespace(id=-1007, title="News", username="news", type=self.chat_type)
 
     async def get_me(self):
         return SimpleNamespace(id=999)
@@ -60,6 +63,11 @@ class FakeBot:
         if self.user_member_error is not None:
             raise self.user_member_error
         return SimpleNamespace(status=self.user_member_status)
+
+    async def get_chat_member_count(self, chat_id):
+        if self.member_count_error is not None:
+            raise self.member_count_error
+        return self.member_count
 
 
 class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -153,9 +161,52 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_permission_gateway_uses_get_chat_member(self) -> None:
         gateway = BotApiPermissionGateway(FakeBot())
         channel = await gateway.resolve_channel("@news")
-        self.assertEqual(channel.id, -1007)
+        self.assertEqual((channel.id, channel.chat_type), (-1007, "channel"))
         self.assertTrue(await gateway.user_is_admin(channel.id, 1))
         self.assertTrue((await gateway.bot_capabilities(channel.id)).ready)
+
+    async def test_permission_gateway_resolves_supergroup_and_rejects_basic_group(self) -> None:
+        bot = FakeBot()
+        bot.chat_type = "supergroup"
+        gateway = BotApiPermissionGateway(bot)
+
+        self.assertEqual((await gateway.resolve_channel(-1007)).chat_type, "supergroup")
+        bot.chat_type = "group"
+        with self.assertRaisesRegex(ValueError, "群组"):
+            await gateway.resolve_channel(-1007)
+
+    async def test_supergroup_bot_capabilities_require_send_and_delete_permissions(self) -> None:
+        bot = FakeBot()
+        bot.chat_type = "supergroup"
+
+        class Member:
+            status = "administrator"
+            can_send_messages = False
+            can_delete_messages = True
+
+        async def get_chat_member(chat_id, user_id):
+            return Member()
+
+        bot.get_chat_member = get_chat_member
+        capabilities = await BotApiPermissionGateway(bot).bot_capabilities(-1007)
+        self.assertEqual((capabilities.is_admin, capabilities.can_send, capabilities.can_delete), (True, False, True))
+
+    async def test_get_member_count_translates_retry_permanent_and_transient_errors(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        self.assertEqual(await gateway.get_member_count(-1007), 42)
+
+        bot.member_count_error = TelegramRetryAfter(GetMe(), "slow down", retry_after=3)
+        with self.assertRaises(FloodWaitSignal):
+            await gateway.get_member_count(-1007)
+        bot.member_count_error = TelegramForbiddenError(GetMe(), "bot removed")
+        with self.assertRaisesRegex(PermanentPublishError, "成员数"):
+            await gateway.get_member_count(-1007)
+        transient = TelegramNetworkError(GetMe(), "offline")
+        bot.member_count_error = transient
+        with self.assertRaises(TelegramNetworkError) as raised:
+            await gateway.get_member_count(-1007)
+        self.assertIs(raised.exception, transient)
 
     async def test_permission_gateway_returns_false_for_definite_non_admin_member(self) -> None:
         bot = FakeBot()

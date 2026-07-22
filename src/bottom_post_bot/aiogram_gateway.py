@@ -32,7 +32,7 @@ from .publisher import FloodWaitSignal, PermanentPublishError
 
 
 TRANSIENT_ERRORS = (TelegramNetworkError, TelegramServerError)
-ADMIN_STATUSES = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, "creator", "administrator"}
+ADMIN_STATUSES = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, "creator", "owner", "administrator"}
 
 
 def _message_id(value) -> int:
@@ -52,10 +52,10 @@ class BotApiPermissionGateway:
 
     async def resolve_channel(self, reference: str | int) -> ChannelIdentity:
         chat = await self.bot.get_chat(reference)
-        chat_type = getattr(chat.type, "value", chat.type)
+        chat_type = str(getattr(chat.type, "value", chat.type)).lower()
         if chat_type not in {"channel", "supergroup"}:
             raise ValueError("目标不是 Telegram 频道或超级群组")
-        return ChannelIdentity(int(chat.id), str(chat.title or chat.id), getattr(chat, "username", None))
+        return ChannelIdentity(int(chat.id), str(chat.title or chat.id), getattr(chat, "username", None), chat_type)
 
     async def user_is_admin(self, channel_id: int, user_id: int) -> bool:
         try:
@@ -71,11 +71,17 @@ class BotApiPermissionGateway:
             member = await self.bot.get_chat_member(channel_id, self._bot_id)
         except (TelegramForbiddenError, TelegramBadRequest):
             return BotCapabilities(False, False, False)
-        creator = member.status in {ChatMemberStatus.CREATOR, "creator"}
+        chat = await self.bot.get_chat(channel_id)
+        chat_type = str(getattr(chat.type, "value", chat.type)).lower()
+        creator = member.status in {ChatMemberStatus.CREATOR, "creator", "owner"}
         admin = member.status in ADMIN_STATUSES
+        if chat_type == "channel":
+            can_send = creator or bool(getattr(member, "can_post_messages", False))
+        else:
+            can_send = admin and getattr(member, "can_send_messages", True) is not False
         return BotCapabilities(
             is_admin=admin,
-            can_post=creator or bool(getattr(member, "can_post_messages", False)),
+            can_send=can_send,
             can_delete=creator or bool(getattr(member, "can_delete_messages", False)),
         )
 
@@ -84,6 +90,14 @@ class BotApiGateway:
     def __init__(self, bot, storage_channel_id: int) -> None:
         self.bot = bot
         self.storage_channel_id = storage_channel_id
+
+    async def get_member_count(self, chat_id: int) -> int:
+        try:
+            return int(await self.bot.get_chat_member_count(chat_id))
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PermanentPublishError(f"无法获取成员数：{exc}") from exc
 
     async def copy_messages(self, messages: Sequence[IncomingContent]) -> list[int]:
         if not messages:

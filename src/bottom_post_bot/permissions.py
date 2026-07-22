@@ -19,12 +19,12 @@ class PermissionUnavailable(PermissionDenied):
 @dataclass(frozen=True, slots=True)
 class BotCapabilities:
     is_admin: bool
-    can_post: bool
+    can_send: bool
     can_delete: bool
 
     @property
     def ready(self) -> bool:
-        return self.is_admin and self.can_post and self.can_delete
+        return self.is_admin and self.can_send and self.can_delete
 
 
 class PermissionGateway(Protocol):
@@ -42,11 +42,12 @@ class PermissionService:
 
     async def assert_can_bind(self, user_id: int, reference: str | int):
         channel = await self.gateway.resolve_channel(reference)
+        label = "超级群组" if getattr(channel, "chat_type", "channel") == "supergroup" else "频道"
         if not await self.gateway.user_is_admin(channel.id, user_id):
-            raise PermissionDenied("你必须是该频道的当前管理员")
+            raise PermissionDenied(f"你必须是该{label}的当前管理员")
         capabilities = await self.gateway.bot_capabilities(channel.id)
         if not capabilities.ready:
-            raise PermissionDenied("机器人必须是频道管理员，并拥有发帖和删除消息权限")
+            raise PermissionDenied(f"机器人必须是{label}管理员，并拥有发送和删除消息权限")
         return channel
 
     async def assert_user_can_manage(self, user_id: int, channel_id: int) -> None:
@@ -57,4 +58,6 @@ class PermissionService:
             raise PermissionDenied("你的频道管理员权限已失效")
         capabilities = await self.gateway.bot_capabilities(channel_id)
         if not capabilities.ready:
-            raise PermissionDenied("机器人缺少频道发帖或删除消息权限")
+            channel = await self.repository.get_channel(channel_id)
+            label = "超级群组" if channel is not None and channel["chat_type"] == "supergroup" else "频道"
+            raise PermissionDenied(f"机器人缺少{label}发送或删除消息权限")

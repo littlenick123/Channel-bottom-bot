@@ -11,6 +11,7 @@ class ChannelIdentity:
     id: int
     title: str
     username: str | None
+    chat_type: str = "channel"
 
 
 class ChannelService:
@@ -46,12 +47,25 @@ class ChannelService:
         if channel.id == self.storage_channel_id:
             raise PermissionDenied("私密存储频道不能绑定为目标频道")
         await self.repository.upsert_channel(
-            channel.id, channel.title, channel.username, self.default_refresh_delay
+            channel.id, channel.title, channel.username, self.default_refresh_delay, channel.chat_type
         )
         created = await self.repository.bind_manager(user_id, channel.id, self.max_channels)
         if created:
             await self.repository.audit(channel.id, user_id, "channel.bind", {})
         return channel, created
+
+    async def reconcile_managed_chats(self) -> list[ChannelIdentity]:
+        """Re-read Telegram identities for managed chats, retaining their configured options."""
+        reconciled: list[ChannelIdentity] = []
+        for row in await self.repository.list_managed_channels():
+            channel = await self.permissions.gateway.resolve_channel(int(row["id"]))
+            if channel.id == self.storage_channel_id:
+                continue
+            await self.repository.upsert_channel(
+                channel.id, channel.title, channel.username, int(row["refresh_delay_seconds"]), channel.chat_type
+            )
+            reconciled.append(channel)
+        return reconciled
 
     async def assign_slot(self, channel_id: int, slot_number: int, revision_id: int, actor_id: int) -> None:
         await self.permissions.assert_user_can_manage(actor_id, channel_id)

@@ -161,3 +161,13 @@ class AnalyticsService:
             yesterday=yesterday,
             stats_push_enabled=subscribed,
         )
+
+
+class MemberUpdateAdapter:
+    """Bridges aiogram's update envelope to the analytics service."""
+
+    def __init__(self, analytics: AnalyticsService) -> None:
+        self.analytics = analytics
+
+    async def handle(self, event, event_update) -> bool:
+        return await self.analytics.record_member_update(int(event_update.update_id), event)

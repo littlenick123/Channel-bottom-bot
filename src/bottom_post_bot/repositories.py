@@ -851,6 +851,13 @@ class Repository:
             )
         )
 
+    async def list_managed_channels(self):
+        return await self.db.fetch_all(
+            """SELECT c.* FROM channels AS c
+               WHERE EXISTS (SELECT 1 FROM channel_managers AS m WHERE m.channel_id=c.id)
+               ORDER BY c.id"""
+        )
+
     async def get_manager_stats_push_enabled(self, user_id: int, channel_id: int) -> bool | None:
         row = await self.db.fetch_one(
             "SELECT stats_push_enabled FROM channel_managers WHERE user_id=? AND channel_id=?", (user_id, channel_id)

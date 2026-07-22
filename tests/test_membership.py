@@ -2,6 +2,7 @@ import json
 import asyncio
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from aiogram.methods import GetMe
 
 from bottom_post_bot.aiogram_gateway import BotApiPermissionGateway
 from bottom_post_bot.app import build_router
+from bottom_post_bot.analytics import AnalyticsService, MemberUpdateAdapter
 from bottom_post_bot.channels import ChannelIdentity, ChannelService
 from bottom_post_bot.database import Database
 from bottom_post_bot.domain import ContentItem
@@ -75,6 +77,7 @@ def channel_event(
         from_user=SimpleNamespace(id=actor_id, full_name=actor_name, username=actor_name.lower()),
         old_chat_member=SimpleNamespace(status=old_status),
         new_chat_member=SimpleNamespace(status=new_status),
+        date=datetime(2026, 1, 2, tzinfo=UTC),
     )
 
 
@@ -96,7 +99,10 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.bot = FakeBot()
         self.notifier = TelegramAdminNotifier(self.bot, self.repository, self.gateway)
-        self.membership = ChatMembershipService(self.repository, self.channels, self.notifier, storage_channel_id=-10050)
+        self.analytics = AnalyticsService(self.repository, SimpleNamespace())
+        self.membership = ChatMembershipService(
+            self.repository, self.channels, self.notifier, storage_channel_id=-10050, analytics=self.analytics
+        )
 
     async def asyncTearDown(self) -> None:
         await self.db.close()
@@ -148,16 +154,37 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.audit_rows("channel.auto_bind")), 1)
         self.assertEqual(len(self.bot.messages), 1)
 
-    async def test_storage_channels_supergroups_and_other_chat_types_are_ignored(self) -> None:
+    async def test_storage_channel_and_basic_group_are_ignored(self) -> None:
         for event in (
             channel_event(channel_id=-10050),
-            channel_event(channel_id=-1008, chat_type="supergroup"),
             channel_event(channel_id=-1008, chat_type="group"),
         ):
             await self.membership.handle(event)
 
         self.assertIsNone(await self.repository.get_channel(-10050))
         self.assertIsNone(await self.repository.get_channel(-1008))
+
+    async def test_supergroup_promotion_binds_persists_type_and_initializes_analytics(self) -> None:
+        self.gateway.channels[-1008] = ChannelIdentity(-1008, "Group", "group", "supergroup")
+
+        await self.membership.handle(channel_event(channel_id=-1008, title="Group", username="group", chat_type="supergroup"))
+
+        self.assertTrue(await self.repository.is_bound_manager(42, -1008))
+        self.assertEqual((await self.repository.get_channel(-1008))["chat_type"], "supergroup")
+        self.assertIsNotNone(await self.repository.get_analytics_state(-1008))
+        self.assertEqual(self.bot.messages[-1]["text"], "已自动绑定超级群组“Group”（ID: -1008）。")
+
+    async def test_startup_reconciles_existing_managed_chat_identity_and_initializes_analytics(self) -> None:
+        await self.repository.upsert_user(42, "Alice")
+        await self.repository.upsert_channel(-1007, "Old title", "old")
+        await self.repository.bind_manager(42, -1007, max_channels=1)
+        self.gateway.channels[-1007] = ChannelIdentity(-1007, "Group", "group", "supergroup")
+
+        self.assertEqual(await self.membership.reconcile_managed_chats(datetime(2026, 1, 2, tzinfo=UTC)), 1)
+
+        chat = await self.repository.get_channel(-1007)
+        self.assertEqual((chat["title"], chat["username"], chat["chat_type"]), ("Group", "group", "supergroup"))
+        self.assertIsNotNone(await self.repository.get_analytics_state(-1007))
 
     async def test_non_admin_actor_records_channel_and_audits_without_manager_or_pause(self) -> None:
         self.gateway.user_admin = False
@@ -302,6 +329,7 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.repository.list_channel_slots(-1007)), 1)
         audit = (await self.audit_rows("channel.bot_access_lost"))[0]
         self.assertEqual((audit["actor_user_id"], audit["details"]), (99, {"old_status": "administrator", "new_status": "left"}))
+        self.assertFalse((await self.repository.get_daily_member_stats(-1007, "2026-01-02")).is_complete)
 
     async def test_unknown_channel_access_loss_is_ignored(self) -> None:
         await self.membership.handle(channel_event(channel_id=-1008, old_status="administrator", new_status="kicked"))
@@ -351,14 +379,36 @@ class TelegramAdminNotifierTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppRegistrationTests(unittest.TestCase):
-    def test_membership_observer_is_included_in_allowed_updates(self) -> None:
+    def test_member_observers_are_included_in_allowed_updates(self) -> None:
         async def handle(*args):
             return None
 
         dispatcher = Dispatcher()
-        dispatcher.include_router(build_router(SimpleNamespace(on_private_message=handle, on_callback=handle), SimpleNamespace(handle=handle), SimpleNamespace(handle=handle)))
+        dispatcher.include_router(
+            build_router(
+                SimpleNamespace(on_private_message=handle, on_callback=handle),
+                SimpleNamespace(handle=handle),
+                SimpleNamespace(handle=handle),
+                SimpleNamespace(handle=handle),
+            )
+        )
 
         self.assertIn("my_chat_member", dispatcher.resolve_used_update_types())
+        self.assertIn("chat_member", dispatcher.resolve_used_update_types())
+
+
+class MemberUpdateAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forwards_aiogram_update_id_to_analytics_service(self) -> None:
+        calls = []
+
+        class Analytics:
+            async def record_member_update(self, update_id, event):
+                calls.append((update_id, event))
+
+        event = channel_event()
+        await MemberUpdateAdapter(Analytics()).handle(event, SimpleNamespace(update_id=123))
+
+        self.assertEqual(calls, [(123, event)])
 
 
 if __name__ == "__main__":

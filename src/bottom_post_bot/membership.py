@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import ChatMemberUpdated
 
 from .channels import ChannelService
+from .analytics import AnalyticsService
 from .notifications import TelegramAdminNotifier
 from .permissions import PermissionUnavailable
 from .repositories import Repository, ResourceLimitError
@@ -35,15 +37,18 @@ class ChatMembershipService:
         notifier: TelegramAdminNotifier,
         *,
         storage_channel_id: int,
+        analytics: AnalyticsService | None = None,
     ) -> None:
         self.repository = repository
         self.channels = channels
         self.notifier = notifier
         self.storage_channel_id = storage_channel_id
+        self.analytics = analytics
 
     async def handle(self, event: ChatMemberUpdated) -> None:
         chat = event.chat
-        if _status_name(chat.type) != "channel" or int(chat.id) == self.storage_channel_id:
+        chat_type = _status_name(chat.type)
+        if chat_type not in {"channel", "supergroup"} or int(chat.id) == self.storage_channel_id:
             return
 
         actor = event.from_user
@@ -62,6 +67,9 @@ class ChatMembershipService:
                 "channel.bot_access_lost",
                 {"old_status": old_status, "new_status": new_status},
             )
+            if self.analytics is not None:
+                occurred_at = getattr(event, "date", datetime.now(UTC))
+                await self.analytics.mark_permission_gap(channel_id, occurred_at, occurred_at, "bot access lost")
             return
 
         if new_status not in _ADMIN_STATUSES:
@@ -74,6 +82,7 @@ class ChatMembershipService:
             getattr(chat, "title", None) or str(channel_id),
             getattr(chat, "username", None),
             self.channels.default_refresh_delay,
+            chat_type,
         )
         try:
             _, created = await self.channels.bind_with_result(actor.id, channel_id)
@@ -100,6 +109,18 @@ class ChatMembershipService:
                         await self.repository.pause_channel(channel_id, "bot lacks required channel capabilities")
             return
 
+        if self.analytics is not None:
+            await self.analytics.initialize_channel(channel_id, getattr(event, "date", datetime.now(UTC)))
         if created:
             await self.repository.audit(channel_id, actor.id, "channel.auto_bind", {})
-            await self.notifier.notify_user(actor.id, f"已自动绑定频道“{getattr(chat, 'title', None) or channel_id}”（ID: {channel_id}）。")
+            label = "超级群组" if chat_type == "supergroup" else "频道"
+            await self.notifier.notify_user(actor.id, f"已自动绑定{label}“{getattr(chat, 'title', None) or channel_id}”（ID: {channel_id}）。")
+
+    async def reconcile_managed_chats(self, activated_at: datetime | None = None) -> int:
+        """Refresh persisted Telegram chat identities when the process starts."""
+        identities = await self.channels.reconcile_managed_chats()
+        if self.analytics is not None:
+            timestamp = activated_at or datetime.now(UTC)
+            for identity in identities:
+                await self.analytics.initialize_channel(identity.id, timestamp)
+        return len(identities)
