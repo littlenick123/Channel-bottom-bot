@@ -1084,6 +1084,16 @@ class Repository:
             )
             return cursor.rowcount > 0
 
+    async def replace_daily_report_payload(self, user_id: int, report_date: str, payload_json: str) -> bool:
+        """Replace only unsent chunk metadata after a definitive permission loss."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries SET payload_json=?
+                   WHERE user_id=? AND report_date=? AND status='sending'""",
+                (payload_json, user_id, report_date),
+            )
+            return cursor.rowcount > 0
+
     async def record_daily_report_delivery_failure(
         self, user_id: int, report_date: str, error: str, next_attempt_at: float
     ) -> bool:
