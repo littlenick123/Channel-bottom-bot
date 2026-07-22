@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Iterable
@@ -121,6 +122,35 @@ class RefreshJob:
     attempts: int
     reason: str
     last_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DailyMemberStats:
+    stat_date: date
+    joined_count: int = 0
+    left_count: int = 0
+    is_complete: bool = True
+    incomplete_reason: str | None = None
+
+    @property
+    def net_change(self) -> int:
+        return self.joined_count - self.left_count
+
+
+@dataclass(frozen=True, slots=True)
+class MemberStatsReport:
+    chat_id: int
+    chat_title: str
+    chat_type: str
+    current_member_count: int | None
+    current_count_at: float | None
+    today: DailyMemberStats
+    yesterday: DailyMemberStats
+    stats_push_enabled: bool
+
+    @property
+    def subscribed(self) -> bool:
+        return self.stats_push_enabled
 
 
 def enabled_slots_in_publish_order(slots: Iterable[SlotSnapshot]) -> list[SlotSnapshot]:

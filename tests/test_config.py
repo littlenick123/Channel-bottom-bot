@@ -1,4 +1,5 @@
 import os
+from datetime import time
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +25,33 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.max_slots_per_channel, 10)
         self.assertEqual(settings.pending_draft_ttl_seconds, 600)
         self.assertEqual(settings.pending_cleanup_interval_seconds, 60)
+        self.assertEqual(settings.stats_timezone, "Asia/Shanghai")
+        self.assertEqual(settings.stats_push_time, time(0, 5))
+
+    def test_loads_valid_analytics_timezone_and_push_time(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "123:token",
+            "STORAGE_CHANNEL_ID": "-1001234567890",
+            "OPERATOR_USER_IDS": "7",
+            "STATS_TIMEZONE": "Europe/London",
+            "STATS_PUSH_TIME": "23:59",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.stats_timezone, "Europe/London")
+        self.assertEqual(settings.stats_push_time, time(23, 59))
+
+    def test_rejects_invalid_analytics_timezone_and_push_time(self) -> None:
+        base = {
+            "TELEGRAM_BOT_TOKEN": "123:token",
+            "STORAGE_CHANNEL_ID": "-1001234567890",
+            "OPERATOR_USER_IDS": "7",
+        }
+        for name, value in (("STATS_TIMEZONE", "Mars/Olympus"), ("STATS_PUSH_TIME", "9:05"), ("STATS_PUSH_TIME", "24:00")):
+            with self.subTest(name=name, value=value), patch.dict(os.environ, base | {name: value}, clear=True):
+                with self.assertRaisesRegex(ConfigurationError, name):
+                    Settings.from_env()
 
     def test_rejects_missing_required_value(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

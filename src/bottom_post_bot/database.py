@@ -197,6 +197,60 @@ MIGRATION_5 = (
     """,
 )
 
+MIGRATION_6 = (
+    "ALTER TABLE channels ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'channel'",
+    "ALTER TABLE channel_managers ADD COLUMN stats_push_enabled INTEGER NOT NULL DEFAULT 1",
+    """
+    CREATE TABLE member_daily_stats (
+        channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        stat_date TEXT NOT NULL,
+        joined_count INTEGER NOT NULL DEFAULT 0 CHECK (joined_count >= 0),
+        left_count INTEGER NOT NULL DEFAULT 0 CHECK (left_count >= 0),
+        is_complete INTEGER NOT NULL DEFAULT 1,
+        incomplete_reason TEXT,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (channel_id, stat_date)
+    )
+    """,
+    """
+    CREATE TABLE processed_member_updates (
+        update_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        direction TEXT NOT NULL CHECK (direction IN ('join', 'leave')),
+        event_at REAL NOT NULL,
+        processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE chat_analytics_state (
+        channel_id INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+        started_at REAL NOT NULL,
+        last_member_count INTEGER,
+        last_count_at REAL
+    )
+    """,
+    """
+    CREATE TABLE analytics_runtime_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_heartbeat_at REAL
+    )
+    """,
+    """
+    CREATE TABLE daily_report_deliveries (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        report_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at REAL,
+        last_error TEXT,
+        sent_at REAL,
+        PRIMARY KEY (user_id, report_date)
+    )
+    """,
+    "CREATE INDEX idx_processed_member_updates_event_at ON processed_member_updates(event_at)",
+    "CREATE INDEX idx_daily_report_deliveries_due ON daily_report_deliveries(status, next_attempt_at)",
+)
+
 
 class Database:
     def __init__(self, connection: aiosqlite.Connection) -> None:
@@ -279,6 +333,12 @@ class Database:
                                 (button["id"],),
                             )
                     await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (5)")
+                await self.connection.commit()
+                if version < 6:
+                    await self.connection.execute("BEGIN IMMEDIATE")
+                    for statement in MIGRATION_6:
+                        await self.connection.execute(statement)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (6)")
                 await self.connection.commit()
             except Exception:
                 await self.connection.rollback()

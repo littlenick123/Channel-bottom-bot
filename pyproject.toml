@@ -11,6 +11,7 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiogram>=3.26,<4",
     "aiosqlite>=0.21,<1",
+    "tzdata>=2025.1,<2027",
 ]
 
 [project.optional-dependencies]

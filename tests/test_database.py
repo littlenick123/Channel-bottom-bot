@@ -31,7 +31,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         version = await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations")
         self.assertEqual(foreign_keys, 1)
         self.assertEqual(str(journal_mode).lower(), "wal")
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
 
     async def test_migration_four_backfills_slot_names_from_existing_drafts(self) -> None:
         await self.db.close()
@@ -40,7 +40,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 5)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
         slot = await self.db.fetch_one(
             "SELECT display_name, name_customized FROM channel_slots WHERE channel_id=? AND slot_number=?",
             (-1009, 1),
@@ -111,7 +111,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.db = await Database.open(database_path)
         self.repo = Repository(self.db)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 5)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
         active_buttons = await self.db.fetch_all("SELECT id, url FROM draft_buttons ORDER BY id")
         self.assertEqual([(row["id"], row["url"]) for row in active_buttons], [(valid_id, "HTTPS://example.com/path")])
         quarantined = await self.db.fetch_all(
@@ -129,6 +129,54 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([button.url for button in draft.current_revision.buttons], ["HTTPS://example.com/path"])
         self.assertEqual([button.url for button in slots[0].revision.buttons], ["HTTPS://example.com/path"])
         self.assertEqual([button.url for button in publish_slots[0].revision.buttons], ["HTTPS://example.com/path"])
+
+    async def test_migration_six_adds_analytics_schema_from_version_five(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v5.sqlite3"
+        self._create_version_four_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            for statement in database.MIGRATION_5:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (5)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.db = await Database.open(database_path)
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
+        columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channels)")}
+        self.assertIn("chat_type", columns)
+        self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='member_daily_stats'"))
+        self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='processed_member_updates'"))
+
+    async def test_migration_six_rolls_back_every_statement_when_one_fails(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v5-rollback.sqlite3"
+        self._create_version_four_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            for statement in database.MIGRATION_5:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (5)")
+            connection.commit()
+        finally:
+            connection.close()
+        connection = await aiosqlite.connect(database_path)
+        connection.row_factory = aiosqlite.Row
+        self.db = Database(connection)
+        await self.db._configure()
+        original_migration = database.MIGRATION_6
+        database.MIGRATION_6 = (*original_migration[:-1], "THIS IS NOT VALID SQL")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                await self.db._migrate()
+        finally:
+            database.MIGRATION_6 = original_migration
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 5)
+        self.assertIsNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='member_daily_stats'"))
 
     async def test_migration_five_rolls_back_quarantine_and_deletion_when_validation_fails(self) -> None:
         await self.db.close()

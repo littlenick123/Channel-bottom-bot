@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from datetime import time
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigurationError(ValueError):
@@ -30,6 +32,25 @@ def _integer(name: str, default: int | None = None, *, positive: bool = False) -
     return value
 
 
+def _timezone(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise ConfigurationError(f"{name} must be a known IANA timezone") from exc
+    return value
+
+
+def _clock_time(name: str, default: time) -> time:
+    value = os.getenv(name, default.strftime("%H:%M"))
+    if len(value) != 5 or value[2] != ":" or not value.replace(":", "").isdigit():
+        raise ConfigurationError(f"{name} must use 24-hour HH:MM format")
+    try:
+        return time.fromisoformat(value)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must use 24-hour HH:MM format") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     bot_token: str
@@ -44,6 +65,8 @@ class Settings:
     conversation_timeout_seconds: int = 900
     pending_draft_ttl_seconds: int = 600
     pending_cleanup_interval_seconds: int = 60
+    stats_timezone: str = "Asia/Shanghai"
+    stats_push_time: time = time(0, 5)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,4 +92,6 @@ class Settings:
             conversation_timeout_seconds=_integer("CONVERSATION_TIMEOUT_SECONDS", 900, positive=True),
             pending_draft_ttl_seconds=_integer("PENDING_DRAFT_TTL_SECONDS", 600, positive=True),
             pending_cleanup_interval_seconds=_integer("PENDING_CLEANUP_INTERVAL_SECONDS", 60, positive=True),
+            stats_timezone=_timezone("STATS_TIMEZONE", "Asia/Shanghai"),
+            stats_push_time=_clock_time("STATS_PUSH_TIME", time(0, 5)),
         )

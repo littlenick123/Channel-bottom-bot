@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date
 from typing import Iterable, Sequence
 
 from .database import Database
-from .domain import ButtonSpec, ContentItem, Draft, DraftRevision, PendingDraft, RefreshJob, SlotSnapshot
+from .domain import ButtonSpec, ContentItem, DailyMemberStats, Draft, DraftRevision, PendingDraft, RefreshJob, SlotSnapshot
 
 
 class ResourceLimitError(ValueError):
@@ -28,12 +29,18 @@ class Repository:
         )
 
     async def upsert_channel(
-        self, channel_id: int, title: str, username: str | None, refresh_delay_seconds: int = 10
+        self,
+        channel_id: int,
+        title: str,
+        username: str | None,
+        refresh_delay_seconds: int = 10,
+        chat_type: str = "channel",
     ) -> None:
         await self.db.execute(
-            """INSERT INTO channels(id, title, username, refresh_delay_seconds) VALUES (?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET title=excluded.title, username=excluded.username, updated_at=CURRENT_TIMESTAMP""",
-            (channel_id, title, username, refresh_delay_seconds),
+            """INSERT INTO channels(id, title, username, refresh_delay_seconds, chat_type) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET title=excluded.title, username=excluded.username,
+                   chat_type=excluded.chat_type, updated_at=CURRENT_TIMESTAMP""",
+            (channel_id, title, username, refresh_delay_seconds, chat_type),
         )
 
     async def bind_manager(self, user_id: int, channel_id: int, max_channels: int) -> bool:
@@ -822,6 +829,165 @@ class Repository:
     async def list_manager_ids(self, channel_id: int) -> list[int]:
         rows = await self.db.fetch_all("SELECT user_id FROM channel_managers WHERE channel_id=?", (channel_id,))
         return [int(row["user_id"]) for row in rows]
+
+    async def is_stats_managed_channel(self, channel_id: int) -> bool:
+        return bool(
+            await self.db.fetch_value(
+                """SELECT 1 FROM channels AS channel
+                   WHERE channel.id=? AND EXISTS (
+                       SELECT 1 FROM channel_managers AS manager WHERE manager.channel_id=channel.id
+                   )""",
+                (channel_id,),
+            )
+        )
+
+    async def get_manager_stats_push_enabled(self, user_id: int, channel_id: int) -> bool | None:
+        row = await self.db.fetch_one(
+            "SELECT stats_push_enabled FROM channel_managers WHERE user_id=? AND channel_id=?", (user_id, channel_id)
+        )
+        return None if row is None else bool(row["stats_push_enabled"])
+
+    async def set_manager_stats_push_enabled(self, user_id: int, channel_id: int, enabled: bool) -> bool:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                "UPDATE channel_managers SET stats_push_enabled=? WHERE user_id=? AND channel_id=?",
+                (int(enabled), user_id, channel_id),
+            )
+            return cursor.rowcount > 0
+
+    async def initialize_analytics(self, channel_id: int, started_at: float, stat_date: str) -> bool:
+        """Create collection state once and flag the partial activation day."""
+        async with self.db.transaction() as connection:
+            exists = await (
+                await connection.execute(
+                    """SELECT 1 FROM channel_managers WHERE channel_id=? LIMIT 1""", (channel_id,)
+                )
+            ).fetchone()
+            if not exists:
+                return False
+            cursor = await connection.execute(
+                "INSERT OR IGNORE INTO chat_analytics_state(channel_id, started_at) VALUES (?, ?)",
+                (channel_id, started_at),
+            )
+            if cursor.rowcount:
+                await self._mark_member_dates_incomplete(
+                    connection, channel_id, (stat_date,), "statistics started during this day"
+                )
+            return True
+
+    async def record_member_transition(
+        self,
+        update_id: int,
+        channel_id: int,
+        direction: str,
+        event_at: float,
+        stat_date: str,
+    ) -> bool:
+        if direction not in {"join", "leave"}:
+            raise ValueError("direction must be join or leave")
+        async with self.db.transaction() as connection:
+            managed = await (
+                await connection.execute("SELECT 1 FROM channel_managers WHERE channel_id=? LIMIT 1", (channel_id,))
+            ).fetchone()
+            if not managed:
+                return False
+            inserted = await connection.execute(
+                """INSERT OR IGNORE INTO processed_member_updates(update_id, channel_id, direction, event_at)
+                   VALUES (?, ?, ?, ?)""",
+                (update_id, channel_id, direction, event_at),
+            )
+            if not inserted.rowcount:
+                return False
+            created_state = await connection.execute(
+                "INSERT OR IGNORE INTO chat_analytics_state(channel_id, started_at) VALUES (?, ?)",
+                (channel_id, event_at),
+            )
+            if created_state.rowcount:
+                await self._mark_member_dates_incomplete(
+                    connection, channel_id, (stat_date,), "statistics started during this day"
+                )
+            column = "joined_count" if direction == "join" else "left_count"
+            await connection.execute(
+                f"""INSERT INTO member_daily_stats(channel_id, stat_date, {column}) VALUES (?, ?, 1)
+                    ON CONFLICT(channel_id, stat_date) DO UPDATE SET
+                        {column}={column}+1, updated_at=CURRENT_TIMESTAMP""",
+                (channel_id, stat_date),
+            )
+            return True
+
+    async def mark_member_dates_incomplete(
+        self, channel_id: int, stat_dates: Sequence[str], reason: str
+    ) -> None:
+        if not stat_dates:
+            return
+        async with self.db.transaction() as connection:
+            await self._mark_member_dates_incomplete(connection, channel_id, stat_dates, reason)
+
+    async def _mark_member_dates_incomplete(self, connection, channel_id: int, stat_dates: Sequence[str], reason: str) -> None:
+        for stat_date in stat_dates:
+            await connection.execute(
+                """INSERT INTO member_daily_stats(channel_id, stat_date, is_complete, incomplete_reason)
+                   VALUES (?, ?, 0, ?)
+                   ON CONFLICT(channel_id, stat_date) DO UPDATE SET
+                       is_complete=0, incomplete_reason=COALESCE(member_daily_stats.incomplete_reason, excluded.incomplete_reason),
+                       updated_at=CURRENT_TIMESTAMP""",
+                (channel_id, stat_date, reason),
+            )
+
+    async def get_daily_member_stats(self, channel_id: int, stat_date: str | date) -> DailyMemberStats | None:
+        value = stat_date.isoformat() if isinstance(stat_date, date) else stat_date
+        row = await self.db.fetch_one(
+            """SELECT stat_date, joined_count, left_count, is_complete, incomplete_reason
+               FROM member_daily_stats WHERE channel_id=? AND stat_date=?""",
+            (channel_id, value),
+        )
+        return None if row is None else self._daily_member_stats(row)
+
+    @staticmethod
+    def _daily_member_stats(row) -> DailyMemberStats:
+        return DailyMemberStats(
+            date.fromisoformat(str(row["stat_date"])),
+            int(row["joined_count"]),
+            int(row["left_count"]),
+            bool(row["is_complete"]),
+            row["incomplete_reason"],
+        )
+
+    async def get_analytics_state(self, channel_id: int):
+        return await self.db.fetch_one("SELECT * FROM chat_analytics_state WHERE channel_id=?", (channel_id,))
+
+    async def set_member_count_cache(self, channel_id: int, member_count: int, counted_at: float) -> bool:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE chat_analytics_state SET last_member_count=?, last_count_at=? WHERE channel_id=?""",
+                (member_count, counted_at, channel_id),
+            )
+            return cursor.rowcount > 0
+
+    async def clear_member_count_cache(self, channel_id: int) -> None:
+        await self.db.execute(
+            "UPDATE chat_analytics_state SET last_member_count=NULL, last_count_at=NULL WHERE channel_id=?", (channel_id,)
+        )
+
+    async def cleanup_processed_member_updates(self, before_event_at: float) -> int:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute("DELETE FROM processed_member_updates WHERE event_at < ?", (before_event_at,))
+            return cursor.rowcount
+
+    async def list_stats_managed_channel_ids(self) -> list[int]:
+        rows = await self.db.fetch_all("SELECT DISTINCT channel_id FROM channel_managers ORDER BY channel_id")
+        return [int(row["channel_id"]) for row in rows]
+
+    async def get_analytics_heartbeat(self) -> float | None:
+        value = await self.db.fetch_value("SELECT last_heartbeat_at FROM analytics_runtime_state WHERE id=1")
+        return None if value is None else float(value)
+
+    async def set_analytics_heartbeat(self, heartbeat_at: float) -> None:
+        await self.db.execute(
+            """INSERT INTO analytics_runtime_state(id, last_heartbeat_at) VALUES (1, ?)
+               ON CONFLICT(id) DO UPDATE SET last_heartbeat_at=excluded.last_heartbeat_at""",
+            (heartbeat_at,),
+        )
 
     async def health_counts(self) -> dict[str, int]:
         names = ("users", "channels", "drafts", "refresh_jobs")
