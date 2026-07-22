@@ -1,7 +1,9 @@
+import asyncio
 from datetime import UTC, datetime, time
 from pathlib import Path
 import tempfile
 import unittest
+import json
 from unittest.mock import AsyncMock, patch
 
 from bottom_post_bot.analytics import AnalyticsService
@@ -147,6 +149,33 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.delivery.calls[2][1], failed_chunk)
         self.assertNotEqual(self.delivery.calls[2][1], first_chunk)
 
+    async def test_retry_filters_revoked_chat_from_unsent_chunk_but_delivers_other_chats(self) -> None:
+        await self.repo.set_manager_stats_push_enabled(7, -1002, False)
+        await self.repo.set_manager_stats_push_enabled(8, -1002, False)
+        for number in range(15):
+            chat_id = -1200 - number
+            await self.repo.upsert_channel(chat_id, f"chat-{number}-" + "x" * 190, None)
+            await self.repo.bind_manager(7, chat_id, 30)
+        await self.db.execute("UPDATE channel_managers SET bound_at='2026-01-01 00:00:00'")
+        self.delivery.errors = [None, RuntimeError("network")]
+        now = datetime(2026, 1, 2, 0, 6, tzinfo=UTC)
+
+        await self.scheduler.run_due_once(now)
+
+        row = await self.db.fetch_one("SELECT payload_json, next_chunk_index FROM daily_report_deliveries WHERE user_id=7")
+        payload = json.loads(row["payload_json"])
+        self.assertEqual(row["next_chunk_index"], 1)
+        revoked = payload["chunks"][1]["reports"][0]
+        retained = payload["chunks"][1]["reports"][1]
+        self.permissions.denied.add((7, revoked["chat_id"]))
+
+        await self.scheduler.run_due_once(datetime.fromtimestamp(now.timestamp() + 60, UTC))
+
+        self.assertEqual(len(self.delivery.calls), 3)
+        retry_text = self.delivery.calls[-1][1]
+        self.assertNotIn(revoked["text"].split("\n", 1)[0], retry_text)
+        self.assertIn(retained["text"].split("\n", 1)[0], retry_text)
+
     async def test_definitive_permission_loss_excludes_chat_without_retry(self) -> None:
         self.permissions.denied.add((7, -1001))
         await self.repo.set_manager_stats_push_enabled(7, -1002, False)
@@ -168,7 +197,7 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.scheduler.run_due_once = AsyncMock(side_effect=stop_after_first_run)
         async def immediately_wake(awaitable, *, timeout):
             awaitable.close()
-            return None
+            raise TimeoutError
 
         with patch("bottom_post_bot.scheduler.asyncio.wait_for", new=AsyncMock(side_effect=immediately_wake)) as wait_for:
             await self.scheduler.run_forever()
@@ -176,6 +205,35 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         wait_for.assert_awaited_once()
         self.assertEqual(wait_for.await_args.kwargs["timeout"], 60)
         self.repo.recover_stuck_daily_report_deliveries.assert_awaited_once()
+
+    async def test_ordinary_wake_cannot_bypass_startup_delay_but_stop_can_interrupt(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def controlled_startup_wait(stop_event, seconds):
+            self.assertEqual(seconds, 60)
+            entered.set()
+            await release.wait()
+            return stop_event.is_set()
+
+        scheduler = DailyStatsScheduler(
+            self.repo, self.analytics, self.permissions, self.delivery,
+            timezone="Asia/Shanghai", push_time=time(0, 5),
+            startup_waiter=controlled_startup_wait,
+        )
+        scheduler.repository.recover_stuck_daily_report_deliveries = AsyncMock(return_value=0)
+        task = asyncio.create_task(scheduler.run_forever())
+        await entered.wait()
+
+        scheduler.wake()
+        await asyncio.sleep(0)
+        scheduler.repository.recover_stuck_daily_report_deliveries.assert_not_awaited()
+        self.assertFalse(task.done())
+
+        scheduler.stop()
+        release.set()
+        await task
+        scheduler.repository.recover_stuck_daily_report_deliveries.assert_not_awaited()
 
     async def test_wake_and_stop_signal_scheduler_event(self) -> None:
         self.scheduler._wake.clear()
