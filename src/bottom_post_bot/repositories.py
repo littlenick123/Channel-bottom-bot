@@ -6,7 +6,17 @@ from datetime import date
 from typing import Iterable, Sequence
 
 from .database import Database
-from .domain import ButtonSpec, ContentItem, DailyMemberStats, Draft, DraftRevision, PendingDraft, RefreshJob, SlotSnapshot
+from .domain import (
+    ButtonSpec,
+    ContentItem,
+    DailyMemberStats,
+    DailyReportDelivery,
+    Draft,
+    DraftRevision,
+    PendingDraft,
+    RefreshJob,
+    SlotSnapshot,
+)
 
 
 class ResourceLimitError(ValueError):
@@ -34,13 +44,13 @@ class Repository:
         title: str,
         username: str | None,
         refresh_delay_seconds: int = 10,
-        chat_type: str = "channel",
+        chat_type: str | None = None,
     ) -> None:
         await self.db.execute(
             """INSERT INTO channels(id, title, username, refresh_delay_seconds, chat_type) VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET title=excluded.title, username=excluded.username,
-                   chat_type=excluded.chat_type, updated_at=CURRENT_TIMESTAMP""",
-            (channel_id, title, username, refresh_delay_seconds, chat_type),
+                   chat_type=COALESCE(?, chat_type), updated_at=CURRENT_TIMESTAMP""",
+            (channel_id, title, username, refresh_delay_seconds, chat_type or "channel", chat_type),
         )
 
     async def bind_manager(self, user_id: int, channel_id: int, max_channels: int) -> bool:
@@ -975,7 +985,7 @@ class Repository:
             return cursor.rowcount
 
     async def list_stats_managed_channel_ids(self) -> list[int]:
-        rows = await self.db.fetch_all("SELECT DISTINCT channel_id FROM channel_managers ORDER BY channel_id")
+        rows = await self.db.fetch_all("SELECT channel_id FROM chat_analytics_state ORDER BY channel_id")
         return [int(row["channel_id"]) for row in rows]
 
     async def get_analytics_heartbeat(self) -> float | None:
@@ -987,6 +997,81 @@ class Repository:
             """INSERT INTO analytics_runtime_state(id, last_heartbeat_at) VALUES (1, ?)
                ON CONFLICT(id) DO UPDATE SET last_heartbeat_at=excluded.last_heartbeat_at""",
             (heartbeat_at,),
+        )
+
+    async def reserve_daily_report_delivery(self, user_id: int, report_date: str, due_at: float) -> bool:
+        """Create one idempotent scheduled delivery for a user and local report date."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """INSERT OR IGNORE INTO daily_report_deliveries(user_id, report_date, status, next_attempt_at)
+                   VALUES (?, ?, 'pending', ?)""",
+                (user_id, report_date, due_at),
+            )
+            return cursor.rowcount > 0
+
+    async def list_due_daily_report_deliveries(self, now: float, limit: int = 100) -> list[DailyReportDelivery]:
+        rows = await self.db.fetch_all(
+            """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at
+               FROM daily_report_deliveries
+               WHERE status IN ('pending', 'retry') AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
+               ORDER BY next_attempt_at, user_id, report_date LIMIT ?""",
+            (now, limit),
+        )
+        return [self._daily_report_delivery(row) for row in rows]
+
+    async def claim_daily_report_delivery(self, user_id: int, report_date: str, now: float) -> DailyReportDelivery | None:
+        """Atomically claim a due delivery and count its send attempt."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries
+                   SET status='sending', attempts=attempts+1, next_attempt_at=NULL
+                   WHERE user_id=? AND report_date=? AND status IN ('pending', 'retry')
+                     AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?""",
+                (user_id, report_date, now),
+            )
+            if not cursor.rowcount:
+                return None
+            row = await (
+                await connection.execute(
+                    """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at
+                       FROM daily_report_deliveries WHERE user_id=? AND report_date=?""",
+                    (user_id, report_date),
+                )
+            ).fetchone()
+            return self._daily_report_delivery(row)
+
+    async def record_daily_report_delivery_failure(
+        self, user_id: int, report_date: str, error: str, next_attempt_at: float
+    ) -> bool:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries
+                   SET status='retry', next_attempt_at=?, last_error=?, sent_at=NULL
+                   WHERE user_id=? AND report_date=? AND status='sending'""",
+                (next_attempt_at, error[:1000], user_id, report_date),
+            )
+            return cursor.rowcount > 0
+
+    async def mark_daily_report_delivery_sent(self, user_id: int, report_date: str, sent_at: float) -> bool:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries
+                   SET status='sent', next_attempt_at=NULL, last_error=NULL, sent_at=?
+                   WHERE user_id=? AND report_date=? AND status='sending'""",
+                (sent_at, user_id, report_date),
+            )
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _daily_report_delivery(row) -> DailyReportDelivery:
+        return DailyReportDelivery(
+            int(row["user_id"]),
+            str(row["report_date"]),
+            str(row["status"]),
+            int(row["attempts"]),
+            None if row["next_attempt_at"] is None else float(row["next_attempt_at"]),
+            row["last_error"],
+            None if row["sent_at"] is None else float(row["sent_at"]),
         )
 
     async def health_counts(self) -> dict[str, int]:

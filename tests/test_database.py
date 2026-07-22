@@ -148,8 +148,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
         columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channels)")}
         self.assertIn("chat_type", columns)
+        manager_columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channel_managers)")}
+        self.assertIn("stats_push_enabled", manager_columns)
         self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='member_daily_stats'"))
         self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='processed_member_updates'"))
+        for table, expected_columns in {
+            "member_daily_stats": {"channel_id", "stat_date", "joined_count", "left_count", "is_complete", "incomplete_reason", "updated_at"},
+            "processed_member_updates": {"update_id", "channel_id", "direction", "event_at", "processed_at"},
+            "chat_analytics_state": {"channel_id", "started_at", "last_member_count", "last_count_at"},
+            "analytics_runtime_state": {"id", "last_heartbeat_at"},
+            "daily_report_deliveries": {"user_id", "report_date", "status", "attempts", "next_attempt_at", "last_error", "sent_at"},
+        }.items():
+            with self.subTest(table=table):
+                columns = {row["name"] for row in await self.db.fetch_all(f"PRAGMA table_info({table})")}
+                self.assertTrue(expected_columns <= columns)
+        indexes = {row["name"] for row in await self.db.fetch_all("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn("idx_processed_member_updates_event_at", indexes)
+        self.assertIn("idx_daily_report_deliveries_due", indexes)
 
     async def test_migration_six_rolls_back_every_statement_when_one_fails(self) -> None:
         await self.db.close()

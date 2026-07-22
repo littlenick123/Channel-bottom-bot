@@ -94,7 +94,15 @@ class AnalyticsService:
             return False
         dates = self._intersected_dates(started_at, ended_at)
         for channel_id in await self.repository.list_stats_managed_channel_ids():
-            await self.repository.mark_member_dates_incomplete(channel_id, dates, reason)
+            state = await self.repository.get_analytics_state(channel_id)
+            if state is None:
+                continue
+            activated_at = datetime.fromtimestamp(float(state["started_at"]), self.timezone)
+            effective_start = max(started_at.astimezone(self.timezone), activated_at)
+            if effective_start <= ended_at.astimezone(self.timezone):
+                await self.repository.mark_member_dates_incomplete(
+                    channel_id, self._intersected_dates(effective_start, ended_at), reason
+                )
         return True
 
     async def heartbeat(self, now: datetime) -> bool:

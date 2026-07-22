@@ -153,6 +153,17 @@ class MemberStatsReport:
         return self.stats_push_enabled
 
 
+@dataclass(frozen=True, slots=True)
+class DailyReportDelivery:
+    user_id: int
+    report_date: str
+    status: str
+    attempts: int
+    next_attempt_at: float | None
+    last_error: str | None = None
+    sent_at: float | None = None
+
+
 def enabled_slots_in_publish_order(slots: Iterable[SlotSnapshot]) -> list[SlotSnapshot]:
     return sorted((slot for slot in slots if slot.enabled and slot.revision.items), key=lambda slot: slot.slot_number, reverse=True)
 

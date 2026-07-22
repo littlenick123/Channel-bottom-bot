@@ -56,6 +56,9 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classify_member_transition(member("left"), member("restricted", is_member=True)), "join")
         self.assertEqual(classify_member_transition(member("restricted", is_member=True), member("kicked")), "leave")
         self.assertIsNone(classify_member_transition(member("member"), member("administrator")))
+        self.assertIsNone(classify_member_transition(member("left"), member("kicked")))
+        self.assertIsNone(classify_member_transition(member("restricted", is_member=False), member("left")))
+        self.assertIsNone(classify_member_transition(member("restricted", is_member=True), member("restricted", is_member=True)))
 
     async def test_records_once_at_timezone_midnight_and_ignores_unmanaged(self) -> None:
         joined = event(10, datetime(2026, 1, 1, 16, 1, tzinfo=UTC), member("left"), member("member"))
@@ -72,6 +75,29 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         rows = [await self.repo.get_daily_member_stats(-1001, day) for day in ("2026-01-01", "2026-01-02", "2026-01-03")]
         self.assertTrue(all(row and not row.is_complete for row in rows))
         self.assertEqual(rows[0].incomplete_reason, "statistics started during this day")
+
+    async def test_runtime_gap_does_not_create_history_for_uninitialized_chats_and_clamps_to_activation(self) -> None:
+        await self.repo.upsert_channel(-1002, "Later", "later")
+        await self.repo.bind_manager(7, -1002, 10)
+        activation = datetime(2026, 1, 2, 15, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, activation)
+        self.assertTrue(
+            await self.service.mark_runtime_gap(
+                datetime(2026, 1, 1, 15, tzinfo=UTC), datetime(2026, 1, 3, 15, 1, tzinfo=UTC)
+            )
+        )
+        self.assertIsNone(await self.repo.get_daily_member_stats(-1001, "2026-01-01"))
+        self.assertIsNone(await self.repo.get_daily_member_stats(-1002, "2026-01-02"))
+        self.assertFalse((await self.repo.get_daily_member_stats(-1001, "2026-01-02")).is_complete)
+
+    async def test_permission_gap_and_heartbeat_only_mark_after_threshold(self) -> None:
+        start = datetime(2026, 1, 1, 15, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, start)
+        await self.service.mark_permission_gap(-1001, start, start + timedelta(days=1), "permission lost")
+        self.assertFalse((await self.repo.get_daily_member_stats(-1001, "2026-01-02")).is_complete)
+        self.assertFalse(await self.service.heartbeat(start))
+        self.assertFalse(await self.service.heartbeat(start + timedelta(seconds=300)))
+        self.assertTrue(await self.service.heartbeat(start + timedelta(seconds=601)))
 
     async def test_cleanup_refresh_and_report_cache_fallbacks(self) -> None:
         now = datetime(2026, 2, 1, 2, tzinfo=UTC)
@@ -90,5 +116,30 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stats_cascade_with_channel_deletion(self) -> None:
         await self.service.initialize_channel(-1001, datetime(2026, 1, 1, tzinfo=UTC))
+        await self.service.record_member_update(
+            30, event(30, datetime(2026, 1, 2, tzinfo=UTC), member("left"), member("member"))
+        )
         await self.repo.delete_channel_config(-1001, 7)
         self.assertIsNone(await self.db.fetch_one("SELECT * FROM chat_analytics_state WHERE channel_id=-1001"))
+        self.assertIsNone(await self.db.fetch_one("SELECT * FROM member_daily_stats WHERE channel_id=-1001"))
+        self.assertIsNone(await self.db.fetch_one("SELECT * FROM processed_member_updates WHERE channel_id=-1001"))
+
+    async def test_delivery_ledger_reserves_claims_retries_and_marks_sent(self) -> None:
+        self.assertTrue(await self.repo.reserve_daily_report_delivery(7, "2026-01-02", 100.0))
+        self.assertFalse(await self.repo.reserve_daily_report_delivery(7, "2026-01-02", 100.0))
+        due = await self.repo.list_due_daily_report_deliveries(100.0)
+        self.assertEqual([(delivery.user_id, delivery.report_date, delivery.attempts) for delivery in due], [(7, "2026-01-02", 0)])
+        claimed = await self.repo.claim_daily_report_delivery(7, "2026-01-02", 100.0)
+        self.assertEqual(claimed.attempts, 1)
+        await self.repo.record_daily_report_delivery_failure(7, "2026-01-02", "offline", 200.0)
+        self.assertEqual(await self.repo.list_due_daily_report_deliveries(199.0), [])
+        self.assertEqual((await self.repo.claim_daily_report_delivery(7, "2026-01-02", 200.0)).attempts, 2)
+        await self.repo.mark_daily_report_delivery_sent(7, "2026-01-02", 201.0)
+        self.assertEqual(await self.repo.list_due_daily_report_deliveries(999.0), [])
+
+    async def test_legacy_channel_upsert_preserves_stored_type_but_explicit_type_updates_it(self) -> None:
+        await self.repo.upsert_channel(-1001, "News", "news", chat_type="supergroup")
+        await self.repo.upsert_channel(-1001, "Renamed", "news")
+        self.assertEqual((await self.repo.get_channel(-1001))["chat_type"], "supergroup")
+        await self.repo.upsert_channel(-1001, "Renamed", "news", chat_type="channel")
+        self.assertEqual((await self.repo.get_channel(-1001))["chat_type"], "channel")

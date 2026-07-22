@@ -3,6 +3,7 @@ from datetime import time
 import unittest
 from unittest.mock import patch
 
+from bottom_post_bot import config
 from bottom_post_bot.config import ConfigurationError, Settings
 
 
@@ -52,6 +53,17 @@ class SettingsTests(unittest.TestCase):
             with self.subTest(name=name, value=value), patch.dict(os.environ, base | {name: value}, clear=True):
                 with self.assertRaisesRegex(ConfigurationError, name):
                     Settings.from_env()
+
+    def test_wraps_malformed_timezone_key_as_configuration_error(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "STORAGE_CHANNEL_ID": "-1001",
+            "OPERATOR_USER_IDS": "7",
+            "STATS_TIMEZONE": "Asia/Shanghai",
+        }
+        with patch.dict(os.environ, env, clear=True), patch.object(config, "ZoneInfo", side_effect=ValueError("bad key")):
+            with self.assertRaisesRegex(ConfigurationError, "STATS_TIMEZONE"):
+                Settings.from_env()
 
     def test_rejects_missing_required_value(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

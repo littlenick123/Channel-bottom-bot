@@ -36,7 +36,7 @@ def _timezone(name: str, default: str) -> str:
     value = os.getenv(name, default).strip()
     try:
         ZoneInfo(value)
-    except ZoneInfoNotFoundError as exc:
+    except (ZoneInfoNotFoundError, ValueError) as exc:
         raise ConfigurationError(f"{name} must be a known IANA timezone") from exc
     return value
 
