@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -153,11 +154,13 @@ class AnalyticsService:
                 return DailyMemberStats(report_date)
         return DailyMemberStats(report_date, is_complete=False, incomplete_reason="statistics unavailable for this date")
 
-    async def get_chat_report(self, user_id: int, chat_id: int, now: datetime) -> MemberStatsReport:
+    async def get_chat_report(
+        self, user_id: int, chat_id: int, now: datetime, *, count_observed_at: datetime | None = None
+    ) -> MemberStatsReport:
         subscribed = await self.repository.get_manager_stats_push_enabled(user_id, chat_id)
         if subscribed is None:
             raise AuthorizationError("user has not bound this channel")
-        await self.refresh_current_count(chat_id, now)
+        await self.refresh_current_count(chat_id, count_observed_at or now)
         channel = await self.repository.get_channel(chat_id)
         if channel is None:
             raise AuthorizationError("channel is unavailable")
@@ -166,6 +169,13 @@ class AnalyticsService:
         state = await self.repository.get_analytics_state(chat_id)
         today = self._report_day(await self.repository.get_daily_member_stats(chat_id, current_day), state, current_day)
         yesterday = self._report_day(await self.repository.get_daily_member_stats(chat_id, previous_day), state, previous_day)
+        if state is not None and state["interruption_started_at"] is not None:
+            interruption_day = self.local_date(datetime.fromtimestamp(float(state["interruption_started_at"]), self.timezone))
+            reason = str(state["interruption_reason"] or "statistics interruption")
+            if current_day >= interruption_day:
+                today = replace(today, is_complete=False, incomplete_reason=today.incomplete_reason or reason)
+            if previous_day >= interruption_day:
+                yesterday = replace(yesterday, is_complete=False, incomplete_reason=yesterday.incomplete_reason or reason)
         return MemberStatsReport(
             chat_id=chat_id,
             chat_title=str(channel["title"]),

@@ -93,6 +93,29 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         state = await self.repo.get_analytics_state(-1001)
         self.assertIsNone(state["interruption_started_at"])
 
+    async def test_open_interruption_is_reported_incomplete_before_a_restart_can_close_it(self) -> None:
+        started = datetime(2026, 1, 1, 15, tzinfo=UTC)
+        now = datetime(2026, 1, 2, 15, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, started)
+        await self.service.begin_permission_interruption(-1001, started, "bot access lost")
+
+        report = await self.service.get_chat_report(7, -1001, now)
+
+        self.assertFalse(report.today.is_complete)
+        self.assertIn("bot access lost", report.today.incomplete_reason)
+
+    async def test_historical_report_window_does_not_backdate_the_live_member_count_cache(self) -> None:
+        cutoff = datetime(2026, 1, 2, 0, 5, tzinfo=UTC)
+        observed = datetime(2026, 1, 3, 10, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, cutoff)
+        await self.service.refresh_current_count(-1001, observed)
+
+        report = await self.service.get_chat_report(7, -1001, cutoff, count_observed_at=observed)
+
+        self.assertEqual(report.current_count_at, observed.timestamp())
+        state = await self.repo.get_analytics_state(-1001)
+        self.assertEqual(state["last_count_at"], observed.timestamp())
+
     async def test_activation_and_runtime_gaps_mark_every_intersected_date_incomplete(self) -> None:
         start = datetime(2026, 1, 1, 15, tzinfo=UTC)
         await self.service.initialize_channel(-1001, start)

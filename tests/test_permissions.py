@@ -106,6 +106,22 @@ class PermissionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(daily)
         self.assertFalse(daily.is_complete)
 
+    async def test_manual_rebind_closes_an_open_analytics_interruption_immediately(self) -> None:
+        analytics = AnalyticsService(self.repo, FailingMemberCountGateway(), "Asia/Shanghai")
+        channels = ChannelService(
+            self.repo, PermissionService(self.repo, FakePermissionGateway()),
+            max_channels=10, max_slots=10, storage_channel_id=-10050, analytics=analytics,
+        )
+        await self.repo.upsert_channel(-1007, "News", "news")
+        await self.repo.bind_manager(1, -1007, 10)
+        started = datetime(2026, 1, 1, tzinfo=UTC)
+        await analytics.initialize_channel(-1007, started)
+        await analytics.begin_permission_interruption(-1007, started, "bot unavailable")
+
+        await channels.bind(1, "@news")
+
+        self.assertIsNone((await self.repo.get_analytics_state(-1007))["interruption_started_at"])
+
     async def test_assign_slot_accepts_only_owned_draft(self) -> None:
         await self.repo.upsert_user(2, "Bob")
         permissions = PermissionService(self.repo, FakePermissionGateway())

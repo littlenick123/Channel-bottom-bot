@@ -922,6 +922,56 @@ class Repository:
                 )
             return True
 
+    async def bind_manager_with_analytics(
+        self,
+        user_id: int,
+        display_name: str,
+        channel_id: int,
+        title: str,
+        username: str | None,
+        refresh_delay_seconds: int,
+        chat_type: str,
+        max_channels: int,
+        started_at: float,
+        stat_date: str,
+    ) -> tuple[bool, bool]:
+        """Atomically make a chat manageable and establish its analytics boundary."""
+        async with self.db.transaction() as connection:
+            await connection.execute(
+                "INSERT INTO users(id, display_name) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+                (user_id, display_name),
+            )
+            await connection.execute(
+                """INSERT INTO channels(id, title, username, refresh_delay_seconds, chat_type) VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET title=excluded.title, username=excluded.username,
+                       chat_type=COALESCE(?, chat_type), updated_at=CURRENT_TIMESTAMP""",
+                (channel_id, title, username, refresh_delay_seconds, chat_type, chat_type),
+            )
+            existing = await (
+                await connection.execute(
+                    "SELECT 1 FROM channel_managers WHERE user_id=? AND channel_id=?", (user_id, channel_id)
+                )
+            ).fetchone()
+            if existing:
+                return False, False
+            count = await (
+                await connection.execute("SELECT COUNT(*) FROM channel_managers WHERE user_id=?", (user_id,))
+            ).fetchone()
+            if int(count[0]) >= max_channels:
+                raise ResourceLimitError(f"user can manage at most {max_channels} channels")
+            await connection.execute(
+                "INSERT INTO channel_managers(user_id, channel_id) VALUES (?, ?)", (user_id, channel_id)
+            )
+            created_state = await connection.execute(
+                "INSERT OR IGNORE INTO chat_analytics_state(channel_id, started_at) VALUES (?, ?)",
+                (channel_id, started_at),
+            )
+            if created_state.rowcount:
+                await self._mark_member_dates_incomplete(
+                    connection, channel_id, (stat_date,), "statistics started during this day"
+                )
+            return True, bool(created_state.rowcount)
+
     async def record_member_transition(
         self,
         update_id: int,
@@ -1048,8 +1098,9 @@ class Repository:
     async def set_member_count_cache(self, channel_id: int, member_count: int, counted_at: float) -> bool:
         async with self.db.transaction() as connection:
             cursor = await connection.execute(
-                """UPDATE chat_analytics_state SET last_member_count=?, last_count_at=? WHERE channel_id=?""",
-                (member_count, counted_at, channel_id),
+                """UPDATE chat_analytics_state SET last_member_count=?, last_count_at=?
+                   WHERE channel_id=? AND (last_count_at IS NULL OR last_count_at <= ?)""",
+                (member_count, counted_at, channel_id, counted_at),
             )
             return cursor.rowcount > 0
 

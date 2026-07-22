@@ -264,6 +264,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.repo.bind_manager(1, -1009, max_channels=10))
         self.assertFalse(await self.repo.bind_manager(1, -1009, max_channels=10))
 
+    async def test_atomic_analytics_binding_creates_state_with_manager_and_rolls_back_together(self) -> None:
+        with self.assertRaises(ResourceLimitError):
+            await self.repo.bind_manager_with_analytics(
+                55, "New", -1055, "Channel", None, 10, "channel", 0, 123.0, "2026-01-01"
+            )
+        self.assertIsNone(await self.db.fetch_one("SELECT * FROM users WHERE id=55"))
+        self.assertIsNone(await self.repo.get_channel(-1055))
+        self.assertIsNone(await self.repo.get_analytics_state(-1055))
+
+        created, state_created = await self.repo.bind_manager_with_analytics(
+            55, "New", -1055, "Channel", None, 10, "channel", 10, 123.0, "2026-01-01"
+        )
+        duplicate, duplicate_state = await self.repo.bind_manager_with_analytics(
+            55, "New", -1055, "Channel", None, 10, "channel", 10, 124.0, "2026-01-01"
+        )
+        self.assertEqual((created, state_created, duplicate, duplicate_state), (True, True, False, False))
+        self.assertEqual((await self.repo.get_analytics_state(-1055))["started_at"], 123.0)
+
     async def test_pending_draft_confirmation_preserves_album_order_and_is_one_time(self) -> None:
         await self.repo.upsert_user(1, "Alice")
         pending = await self.repo.create_pending_draft(

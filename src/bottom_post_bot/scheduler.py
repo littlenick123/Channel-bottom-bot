@@ -213,7 +213,14 @@ class DailyStatsScheduler:
         for chat_id in chat_ids:
             try:
                 await self.permissions.assert_user_can_manage(delivery.user_id, chat_id)
-                reports.append(format_chat_report(await self.analytics.get_chat_report(delivery.user_id, chat_id, cutoff), timezone=self.timezone))
+                reports.append(
+                    format_chat_report(
+                        await self.analytics.get_chat_report(
+                            delivery.user_id, chat_id, cutoff, count_observed_at=now
+                        ),
+                        timezone=self.timezone,
+                    )
+                )
                 report_chat_ids.append(chat_id)
             except PermissionUnavailable:
                 raise

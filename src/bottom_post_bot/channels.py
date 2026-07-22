@@ -70,17 +70,30 @@ class ChannelService:
         channel = await self.permissions.assert_can_bind(user_id, reference)
         if channel.id == self.storage_channel_id:
             raise PermissionDenied("私密存储频道不能绑定为目标频道")
-        await self.repository.upsert_channel(
-            channel.id, channel.title, channel.username, self.default_refresh_delay, channel.chat_type
-        )
-        created = await self.repository.bind_manager(user_id, channel.id, self.max_channels)
-        if created:
-            await self.repository.audit(channel.id, user_id, "channel.bind", {})
         if self.analytics is not None:
             activated_at = datetime.now(UTC)
-            await self.analytics.initialize_channel(channel.id, activated_at)
+            created, _ = await self.repository.bind_manager_with_analytics(
+                user_id,
+                "",
+                channel.id,
+                channel.title,
+                channel.username,
+                self.default_refresh_delay,
+                channel.chat_type,
+                self.max_channels,
+                self.analytics._timestamp(activated_at),
+                self.analytics.local_date(activated_at).isoformat(),
+            )
             baseline = await self.analytics.refresh_current_count(channel.id, activated_at)
+            await self.analytics.end_permission_interruption(channel.id, activated_at)
             channel = replace(channel, stats_baseline_available=baseline is not None)
+        else:
+            await self.repository.upsert_channel(
+                channel.id, channel.title, channel.username, self.default_refresh_delay, channel.chat_type
+            )
+            created = await self.repository.bind_manager(user_id, channel.id, self.max_channels)
+        if created:
+            await self.repository.audit(channel.id, user_id, "channel.bind", {})
         return channel, created
 
     async def reconcile_managed_chats(self) -> ReconciledChats:

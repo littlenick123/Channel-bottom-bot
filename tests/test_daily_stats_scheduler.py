@@ -212,9 +212,9 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         report_at: list[datetime] = []
         original = self.analytics.get_chat_report
 
-        async def capture(user_id, chat_id, now):
+        async def capture(user_id, chat_id, now, *, count_observed_at=None):
             report_at.append(now)
-            return await original(user_id, chat_id, now)
+            return await original(user_id, chat_id, now, count_observed_at=count_observed_at)
 
         self.analytics.get_chat_report = capture
         await self.repo.reserve_daily_report_delivery(7, "2026-01-02", cutoff.timestamp())
@@ -228,6 +228,21 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(report_at)
         self.assertTrue(all(value == cutoff for value in report_at))
+
+    async def test_catchup_keeps_daily_window_at_cutoff_but_refreshes_count_at_retry_time(self) -> None:
+        cutoff = datetime(2026, 1, 2, 0, 5, tzinfo=self.scheduler.timezone)
+        previous_cache = datetime(2026, 1, 3, 0, 0, tzinfo=UTC)
+        retry_at = datetime(2026, 1, 3, 0, 6, tzinfo=UTC)
+        await self.analytics.initialize_channel(-1001, cutoff)
+        await self.analytics.refresh_current_count(-1001, previous_cache)
+        await self.repo.reserve_daily_report_delivery(7, "2026-01-02", cutoff.timestamp())
+        delivery = next(item for item in await self.repo.list_due_daily_report_deliveries(retry_at.timestamp()) if item.user_id == 7)
+
+        await self.scheduler._deliver(delivery, retry_at.astimezone(self.scheduler.timezone))
+
+        state = await self.repo.get_analytics_state(-1001)
+        self.assertEqual(state["last_count_at"], retry_at.timestamp())
+        self.assertIn("更新时间：2026-01-03 08:06", self.delivery.calls[-1][1])
 
     async def test_definitive_permission_loss_excludes_chat_without_retry(self) -> None:
         self.permissions.denied.add((7, -1001))
