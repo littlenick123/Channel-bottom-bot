@@ -73,7 +73,19 @@ class Repository:
             return True
 
     async def unbind_manager(self, user_id: int, channel_id: int) -> None:
-        await self.db.execute("DELETE FROM channel_managers WHERE user_id=? AND channel_id=?", (user_id, channel_id))
+        async with self.db.transaction() as connection:
+            count_row = await (
+                await connection.execute("SELECT COUNT(*) FROM channel_managers WHERE channel_id=?", (channel_id,))
+            ).fetchone()
+            await connection.execute("DELETE FROM channel_managers WHERE user_id=? AND channel_id=?", (user_id, channel_id))
+            if int(count_row[0]) == 1:
+                await connection.execute(
+                    """UPDATE chat_analytics_state
+                       SET interruption_started_at=COALESCE(interruption_started_at, ?),
+                           interruption_reason=COALESCE(interruption_reason, 'last manager unbound')
+                       WHERE channel_id=?""",
+                    (time.time(), channel_id),
+                )
 
     async def is_bound_manager(self, user_id: int, channel_id: int) -> bool:
         return bool(
@@ -926,13 +938,6 @@ class Repository:
             ).fetchone()
             if not managed:
                 return False
-            inserted = await connection.execute(
-                """INSERT OR IGNORE INTO processed_member_updates(update_id, channel_id, direction, event_at)
-                   VALUES (?, ?, ?, ?)""",
-                (update_id, channel_id, direction, event_at),
-            )
-            if not inserted.rowcount:
-                return False
             created_state = await connection.execute(
                 "INSERT OR IGNORE INTO chat_analytics_state(channel_id, started_at) VALUES (?, ?)",
                 (channel_id, event_at),
@@ -941,6 +946,17 @@ class Repository:
                 await self._mark_member_dates_incomplete(
                     connection, channel_id, (stat_date,), "statistics started during this day"
                 )
+            state = await (
+                await connection.execute("SELECT started_at FROM chat_analytics_state WHERE channel_id=?", (channel_id,))
+            ).fetchone()
+            ignored = event_at < float(state["started_at"])
+            inserted = await connection.execute(
+                """INSERT OR IGNORE INTO processed_member_updates(update_id, channel_id, direction, event_at, ignored)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (update_id, channel_id, direction, event_at, int(ignored)),
+            )
+            if not inserted.rowcount or ignored:
+                return False
             column = "joined_count" if direction == "join" else "left_count"
             await connection.execute(
                 f"""INSERT INTO member_daily_stats(channel_id, stat_date, {column}) VALUES (?, ?, 1)
@@ -949,6 +965,44 @@ class Repository:
                 (channel_id, stat_date),
             )
             return True
+
+    async def begin_analytics_interruption(self, channel_id: int, started_at: float, reason: str) -> bool:
+        """Persist the first unavailable instant; later failures must not shorten the gap."""
+        async with self.db.transaction() as connection:
+            managed = await (
+                await connection.execute("SELECT 1 FROM channel_managers WHERE channel_id=? LIMIT 1", (channel_id,))
+            ).fetchone()
+            if not managed:
+                return False
+            await connection.execute(
+                "INSERT OR IGNORE INTO chat_analytics_state(channel_id, started_at) VALUES (?, ?)",
+                (channel_id, started_at),
+            )
+            cursor = await connection.execute(
+                """UPDATE chat_analytics_state
+                   SET interruption_started_at=COALESCE(interruption_started_at, ?),
+                       interruption_reason=COALESCE(interruption_reason, ?)
+                   WHERE channel_id=?""",
+                (started_at, reason[:400], channel_id),
+            )
+            return cursor.rowcount > 0
+
+    async def end_analytics_interruption(self, channel_id: int) -> tuple[float, str] | None:
+        async with self.db.transaction() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT interruption_started_at, interruption_reason FROM chat_analytics_state WHERE channel_id=?",
+                    (channel_id,),
+                )
+            ).fetchone()
+            if row is None or row["interruption_started_at"] is None:
+                return None
+            await connection.execute(
+                """UPDATE chat_analytics_state
+                   SET interruption_started_at=NULL, interruption_reason=NULL WHERE channel_id=?""",
+                (channel_id,),
+            )
+            return float(row["interruption_started_at"]), str(row["interruption_reason"] or "statistics interruption")
 
     async def mark_member_dates_incomplete(
         self, channel_id: int, stat_dates: Sequence[str], reason: str

@@ -31,7 +31,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         version = await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations")
         self.assertEqual(foreign_keys, 1)
         self.assertEqual(str(journal_mode).lower(), "wal")
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 7)
 
     async def test_migration_four_backfills_slot_names_from_existing_drafts(self) -> None:
         await self.db.close()
@@ -40,7 +40,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
         slot = await self.db.fetch_one(
             "SELECT display_name, name_customized FROM channel_slots WHERE channel_id=? AND slot_number=?",
             (-1009, 1),
@@ -111,7 +111,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.db = await Database.open(database_path)
         self.repo = Repository(self.db)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
         active_buttons = await self.db.fetch_all("SELECT id, url FROM draft_buttons ORDER BY id")
         self.assertEqual([(row["id"], row["url"]) for row in active_buttons], [(valid_id, "HTTPS://example.com/path")])
         quarantined = await self.db.fetch_all(
@@ -145,12 +145,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 6)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
         columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channels)")}
         self.assertIn("chat_type", columns)
         manager_columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channel_managers)")}
         self.assertIn("stats_push_enabled", manager_columns)
         self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='member_daily_stats'"))
+        analytics_columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(chat_analytics_state)")}
+        self.assertTrue({"interruption_started_at", "interruption_reason"}.issubset(analytics_columns))
         self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='processed_member_updates'"))
         for table, expected_columns in {
             "member_daily_stats": {"channel_id", "stat_date", "joined_count", "left_count", "is_complete", "incomplete_reason", "updated_at"},

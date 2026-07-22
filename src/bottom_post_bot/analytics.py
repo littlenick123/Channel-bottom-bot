@@ -87,6 +87,22 @@ class AnalyticsService:
             channel_id, self._intersected_dates(started_at, ended_at), reason
         )
 
+    async def begin_permission_interruption(self, channel_id: int, started_at: datetime, reason: str) -> bool:
+        started = await self.repository.begin_analytics_interruption(channel_id, self._timestamp(started_at), reason)
+        if started:
+            await self.repository.mark_member_dates_incomplete(channel_id, (self.local_date(started_at).isoformat(),), reason)
+        return started
+
+    async def end_permission_interruption(self, channel_id: int, ended_at: datetime) -> bool:
+        interruption = await self.repository.end_analytics_interruption(channel_id)
+        if interruption is None:
+            return False
+        started_at, reason = interruption
+        await self.mark_permission_gap(
+            channel_id, datetime.fromtimestamp(started_at, self.timezone), ended_at, reason
+        )
+        return True
+
     async def mark_runtime_gap(
         self, started_at: datetime, ended_at: datetime, reason: str = "runtime gap"
     ) -> bool:

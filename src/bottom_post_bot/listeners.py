@@ -52,9 +52,7 @@ class ChannelListener:
         if getattr(event, "out", False) or getattr(wrapped, "action", None) is not None:
             return
         author = getattr(event, "from_user", None)
-        if author is not None and (
-            getattr(author, "is_bot", False) or self.bot_user_id is not None and int(getattr(author, "id", 0)) == self.bot_user_id
-        ):
+        if author is not None and self.bot_user_id is not None and int(getattr(author, "id", 0)) == self.bot_user_id:
             return
         if not _is_user_content(event):
             return

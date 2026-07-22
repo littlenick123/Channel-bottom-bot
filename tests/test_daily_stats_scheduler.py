@@ -176,6 +176,59 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(revoked["text"].split("\n", 1)[0], retry_text)
         self.assertIn(retained["text"].split("\n", 1)[0], retry_text)
 
+    async def test_retry_removes_a_newly_disabled_subscription_from_unsent_chunks(self) -> None:
+        await self.repo.set_manager_stats_push_enabled(7, -1002, False)
+        await self.repo.set_manager_stats_push_enabled(8, -1002, False)
+        for number in range(15):
+            chat_id = -1300 - number
+            await self.repo.upsert_channel(chat_id, f"chat-{number}-" + "x" * 190, None)
+            await self.repo.bind_manager(7, chat_id, 30)
+        await self.db.execute("UPDATE channel_managers SET bound_at='2026-01-01 00:00:00'")
+        self.delivery.errors = [None, RuntimeError("network")]
+        now = datetime(2026, 1, 2, 0, 6, tzinfo=UTC)
+
+        await self.scheduler.run_due_once(now)
+        row = await self.db.fetch_one("SELECT payload_json FROM daily_report_deliveries WHERE user_id=7")
+        disabled = json.loads(row["payload_json"])["chunks"][1]["reports"][0]
+        await self.repo.set_manager_stats_push_enabled(7, disabled["chat_id"], False)
+
+        await self.scheduler.run_due_once(datetime.fromtimestamp(now.timestamp() + 60, UTC))
+
+        self.assertNotIn(disabled["text"].split("\n", 1)[0], self.delivery.calls[-1][1])
+
+    async def test_malformed_payload_retries_one_manager_and_still_delivers_the_next(self) -> None:
+        now = datetime(2026, 1, 2, 0, 6, tzinfo=UTC)
+        await self.repo.reserve_daily_report_delivery(7, "2026-01-02", now.timestamp())
+        await self.db.execute("UPDATE daily_report_deliveries SET payload_json='{broken' WHERE user_id=7")
+
+        await self.scheduler.run_due_once(now)
+
+        failed = await self.db.fetch_one("SELECT status FROM daily_report_deliveries WHERE user_id=7")
+        self.assertEqual(failed["status"], "retry")
+        self.assertEqual([user_id for user_id, _ in self.delivery.calls], [8])
+
+    async def test_late_retry_builds_report_at_its_original_cutoff(self) -> None:
+        cutoff = datetime(2026, 1, 2, 0, 5, tzinfo=self.scheduler.timezone)
+        report_at: list[datetime] = []
+        original = self.analytics.get_chat_report
+
+        async def capture(user_id, chat_id, now):
+            report_at.append(now)
+            return await original(user_id, chat_id, now)
+
+        self.analytics.get_chat_report = capture
+        await self.repo.reserve_daily_report_delivery(7, "2026-01-02", cutoff.timestamp())
+        self.permissions.unavailable.add((7, -1001))
+        await self.scheduler.run_due_once(datetime(2026, 1, 2, 0, 6, tzinfo=UTC))
+        self.permissions.unavailable.clear()
+
+        retry_at = datetime(2026, 1, 3, 0, 6, tzinfo=UTC)
+        delivery = next(item for item in await self.repo.list_due_daily_report_deliveries(retry_at.timestamp()) if item.user_id == 7 and item.report_date == "2026-01-02")
+        await self.scheduler._deliver(delivery, retry_at.astimezone(self.scheduler.timezone))
+
+        self.assertTrue(report_at)
+        self.assertTrue(all(value == cutoff for value in report_at))
+
     async def test_definitive_permission_loss_excludes_chat_without_retry(self) -> None:
         self.permissions.denied.add((7, -1001))
         await self.repo.set_manager_stats_push_enabled(7, -1002, False)
@@ -286,6 +339,33 @@ class DailyStatsSchedulerTests(unittest.IsolatedAsyncioTestCase):
         local_now = now.astimezone(self.scheduler.timezone)
         self.analytics.heartbeat.assert_awaited_once_with(local_now)
         self.analytics.cleanup_processed_updates.assert_awaited_once_with(local_now)
+
+    async def test_maintenance_loop_records_heartbeats_independently_and_isolates_errors(self) -> None:
+        calls = []
+        release = asyncio.Event()
+
+        async def controlled_wait(stop_event, seconds):
+            calls.append(seconds)
+            await release.wait()
+            await stop_event.wait()
+            return True
+
+        scheduler = DailyStatsScheduler(
+            self.repo, self.analytics, self.permissions, self.delivery,
+            timezone="Asia/Shanghai", maintenance_waiter=controlled_wait,
+        )
+        self.analytics.heartbeat = AsyncMock(side_effect=[RuntimeError("heartbeat unavailable"), False])
+        self.analytics.cleanup_processed_updates = AsyncMock(return_value=0)
+        task = asyncio.create_task(scheduler._run_maintenance_loop())
+        while not calls:
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.sleep(0)
+        scheduler.stop()
+        await task
+
+        self.assertEqual(calls[0], 60)
+        self.assertGreaterEqual(self.analytics.heartbeat.await_count, 1)
 
     async def test_stuck_sending_delivery_is_recovered_as_due(self) -> None:
         await self.repo.reserve_daily_report_delivery(7, "2026-01-02", 100.0)

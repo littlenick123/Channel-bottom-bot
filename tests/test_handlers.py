@@ -117,15 +117,25 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schedules_external_supergroup_message_but_filters_bot_and_service_messages(self) -> None:
         scheduler = FakeScheduler()
-        listener = ChannelListener(FakeRepository(), scheduler)
+        listener = ChannelListener(FakeRepository(), scheduler, bot_user_id=999)
         base = dict(chat=SimpleNamespace(id=-1007), message_id=22)
         await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=False), content_type="text"))
-        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=True)))
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(id=999, is_bot=True)))
         await listener.handle(
             SimpleNamespace(**base, new_chat_members=[SimpleNamespace(id=1)], content_type="new_chat_members")
         )
 
         self.assertEqual(scheduler.calls, [(-1007, "channel-message:22", 10)])
+
+    async def test_third_party_bot_message_triggers_but_own_bot_message_does_not(self) -> None:
+        scheduler = FakeScheduler()
+        listener = ChannelListener(FakeRepository(), scheduler, bot_user_id=999)
+        base = dict(chat=SimpleNamespace(id=-1007), message_id=23, content_type="text")
+
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(id=77, is_bot=True)))
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(id=999, is_bot=True)))
+
+        self.assertEqual(scheduler.calls, [(-1007, "channel-message:23", 10)])
 
     async def test_rejects_every_representative_aiogram_service_content_type(self) -> None:
         scheduler = FakeScheduler()

@@ -503,7 +503,7 @@ class StatsHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.handlers.show_stats(SimpleNamespace(), 42)
 
         self.permissions.assert_user_can_manage.assert_awaited_once_with(42, -1007)
-        self.assertIn("当前成员：99", self.handlers._show.await_args.args[1])
+        self.assertIn("当前成员总数：99", self.handlers._show.await_args.args[1])
 
     async def test_multiple_stats_chats_show_short_selector_and_toggle_is_per_manager(self) -> None:
         channel_id = -1001234567890

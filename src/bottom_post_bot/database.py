@@ -253,6 +253,14 @@ MIGRATION_6 = (
     "CREATE INDEX idx_daily_report_deliveries_due ON daily_report_deliveries(status, next_attempt_at)",
 )
 
+# Version 7 is deliberately separate: deployments that already applied migration 6
+# need the same interruption state as new databases.
+MIGRATION_7 = (
+    "ALTER TABLE processed_member_updates ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chat_analytics_state ADD COLUMN interruption_started_at REAL",
+    "ALTER TABLE chat_analytics_state ADD COLUMN interruption_reason TEXT",
+)
+
 
 class Database:
     def __init__(self, connection: aiosqlite.Connection) -> None:
@@ -341,6 +349,12 @@ class Database:
                     for statement in MIGRATION_6:
                         await self.connection.execute(statement)
                     await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (6)")
+                await self.connection.commit()
+                if version < 7:
+                    await self.connection.execute("BEGIN IMMEDIATE")
+                    for statement in MIGRATION_7:
+                        await self.connection.execute(statement)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (7)")
                 await self.connection.commit()
             except Exception:
                 await self.connection.rollback()

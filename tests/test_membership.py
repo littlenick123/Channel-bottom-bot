@@ -175,6 +175,18 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.repository.get_analytics_state(-1008))
         self.assertEqual(self.bot.messages[-1]["text"], "已自动绑定超级群组“Group”（ID: -1008）。")
 
+    async def test_last_manager_leaving_opens_a_persisted_analytics_interruption(self) -> None:
+        self.channels.analytics = self.analytics
+        await self.repository.upsert_user(42, "Alice")
+        await self.repository.upsert_channel(-1007, "News", "news")
+        await self.repository.bind_manager(42, -1007, max_channels=1)
+        await self.analytics.initialize_channel(-1007, datetime(2026, 1, 2, tzinfo=UTC))
+
+        await self.channels.leave(-1007, 42)
+
+        state = await self.repository.get_analytics_state(-1007)
+        self.assertIsNotNone(state["interruption_started_at"])
+
     async def test_startup_reconciles_existing_managed_chat_identity_and_initializes_analytics(self) -> None:
         await self.repository.upsert_user(42, "Alice")
         await self.repository.upsert_channel(-1007, "Old title", "old")
@@ -186,6 +198,23 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         chat = await self.repository.get_channel(-1007)
         self.assertEqual((chat["title"], chat["username"], chat["chat_type"]), ("Group", "group", "supergroup"))
         self.assertIsNotNone(await self.repository.get_analytics_state(-1007))
+
+    async def test_reconciliation_requires_current_bot_capabilities_and_closes_a_persisted_gap_on_recovery(self) -> None:
+        now = datetime(2026, 1, 3, tzinfo=UTC)
+        await self.repository.upsert_user(42, "Alice")
+        await self.repository.upsert_channel(-1007, "News", "news")
+        await self.repository.bind_manager(42, -1007, max_channels=1)
+        await self.analytics.initialize_channel(-1007, datetime(2026, 1, 1, tzinfo=UTC))
+        await self.analytics.begin_permission_interruption(-1007, datetime(2026, 1, 2, tzinfo=UTC), "bot unavailable")
+        self.gateway.bot_ready = False
+
+        self.assertEqual(await self.membership.reconcile_managed_chats(now), 0)
+        self.assertIsNotNone((await self.repository.get_analytics_state(-1007))["interruption_started_at"])
+
+        self.gateway.bot_ready = True
+        self.assertEqual(await self.membership.reconcile_managed_chats(now), 1)
+        self.assertIsNone((await self.repository.get_analytics_state(-1007))["interruption_started_at"])
+        self.assertFalse((await self.repository.get_daily_member_stats(-1007, "2026-01-02")).is_complete)
 
     async def test_startup_reconciliation_continues_after_each_chat_lookup_failure_and_marks_gaps(self) -> None:
         failures = {

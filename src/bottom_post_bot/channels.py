@@ -91,6 +91,9 @@ class ChannelService:
             channel_id = int(row["id"])
             try:
                 channel = await self.permissions.gateway.resolve_channel(channel_id)
+                capabilities = await self.permissions.gateway.bot_capabilities(channel_id)
+                if not capabilities.ready:
+                    raise PermissionDenied("bot lacks required channel capabilities")
             except (TelegramAPIError, UnsupportedChatTypeError, PermissionDenied) as exc:
                 failed_ids.append(channel_id)
                 logger.warning(
@@ -142,4 +145,8 @@ class ChannelService:
 
     async def leave(self, channel_id: int, actor_id: int) -> None:
         await self.permissions.assert_user_can_manage(actor_id, channel_id)
+        if self.analytics is not None and len(await self.repository.list_manager_ids(channel_id)) == 1:
+            await self.analytics.begin_permission_interruption(
+                channel_id, datetime.now(UTC), "last manager unbound"
+            )
         await self.repository.unbind_manager(actor_id, channel_id)

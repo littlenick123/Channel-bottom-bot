@@ -137,6 +137,7 @@ class DailyStatsScheduler:
         push_time: clock_time = clock_time(0, 5),
         clock: Callable[[], float] = time.time,
         startup_waiter: Callable[[asyncio.Event, float], Awaitable[bool]] | None = None,
+        maintenance_waiter: Callable[[asyncio.Event, float], Awaitable[bool]] | None = None,
     ) -> None:
         self.repository = repository
         self.analytics = analytics
@@ -147,7 +148,9 @@ class DailyStatsScheduler:
         self.clock = clock
         self._wake = asyncio.Event()
         self._startup_stop = asyncio.Event()
+        self._maintenance_stop = asyncio.Event()
         self._startup_waiter = startup_waiter or self._wait_for_startup_stop
+        self._maintenance_waiter = maintenance_waiter or self._wait_for_startup_stop
         self._stopping = False
 
     def _now(self) -> datetime:
@@ -166,8 +169,7 @@ class DailyStatsScheduler:
     async def run_due_once(self, instant: datetime | None = None) -> None:
         now = instant.astimezone(self.timezone) if instant is not None else self._now()
         now_timestamp = now.timestamp()
-        await self.analytics.heartbeat(now)
-        await self.analytics.cleanup_processed_updates(now)
+        await self._maintain_analytics(now)
         cutoff = self.report_cutoff(now)
         if now >= cutoff:
             report_date = cutoff.date().isoformat()
@@ -182,10 +184,8 @@ class DailyStatsScheduler:
         claimed = await self.repository.claim_daily_report_delivery(delivery.user_id, delivery.report_date, now.timestamp())
         if claimed is None:
             return
-        payload = await self._payload_for_delivery(claimed, now)
-        if payload is None:
-            return
         try:
+            payload = await self._payload_for_delivery(claimed, now)
             for index, chunk in enumerate(payload["chunks"][claimed.next_chunk_index :], start=claimed.next_chunk_index):
                 await self.delivery_gateway.send_private_text(claimed.user_id, chunk["text"])
                 await self.repository.advance_daily_report_delivery_chunk(claimed.user_id, claimed.report_date, index + 1)
@@ -205,10 +205,7 @@ class DailyStatsScheduler:
     async def _payload_for_delivery(self, delivery, now: datetime) -> dict | None:
         if delivery.payload_json is not None:
             payload = json.loads(delivery.payload_json)
-            payload = await self._filter_unsent_payload(delivery, now, payload)
-            if payload is None:
-                return None
-            return payload
+            return await self._filter_unsent_payload(delivery, payload)
         cutoff = datetime.combine(datetime.fromisoformat(delivery.report_date).date(), self.push_time, tzinfo=self.timezone)
         chat_ids = await self.repository.list_user_stats_subscription_ids(delivery.user_id, self._utc_db_timestamp(cutoff))
         reports = []
@@ -216,21 +213,18 @@ class DailyStatsScheduler:
         for chat_id in chat_ids:
             try:
                 await self.permissions.assert_user_can_manage(delivery.user_id, chat_id)
-                reports.append(format_chat_report(await self.analytics.get_chat_report(delivery.user_id, chat_id, now), timezone=self.timezone))
+                reports.append(format_chat_report(await self.analytics.get_chat_report(delivery.user_id, chat_id, cutoff), timezone=self.timezone))
                 report_chat_ids.append(chat_id)
-            except PermissionUnavailable as exc:
-                await self._retry(delivery, now, exc)
-                return None
+            except PermissionUnavailable:
+                raise
             except PermissionDenied:
                 continue
         if not reports:
-            await self.repository.mark_daily_report_delivery_sent(delivery.user_id, delivery.report_date, now.timestamp())
-            return None
+            return {"chunks": []}
         payload = self._pack_payload(list(zip(report_chat_ids, reports)), f"📈 每日成员统计（{delivery.report_date}）")
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if not await self.repository.store_daily_report_payload(delivery.user_id, delivery.report_date, serialized):
-            await self._retry(delivery, now, RuntimeError("could not persist daily report payload"))
-            return None
+            raise RuntimeError("could not persist daily report payload")
         return payload
 
     @staticmethod
@@ -255,18 +249,21 @@ class DailyStatsScheduler:
             chunks.append({"text": current_text, "header": current_header, "reports": current_reports})
         return {"chunks": chunks}
 
-    async def _filter_unsent_payload(self, delivery, now: datetime, payload: dict) -> dict | None:
+    async def _filter_unsent_payload(self, delivery, payload: dict) -> dict:
         chunks = payload["chunks"]
         filtered = list(chunks[: delivery.next_chunk_index])
         changed = False
         for chunk in chunks[delivery.next_chunk_index :]:
             reports = []
             for report in chunk["reports"]:
+                subscribed = await self.repository.get_manager_stats_push_enabled(delivery.user_id, int(report["chat_id"]))
+                if not subscribed:
+                    changed = True
+                    continue
                 try:
                     await self.permissions.assert_user_can_manage(delivery.user_id, int(report["chat_id"]))
-                except PermissionUnavailable as exc:
-                    await self._retry(delivery, now, exc)
-                    return None
+                except PermissionUnavailable:
+                    raise
                 except PermissionDenied:
                     changed = True
                     continue
@@ -279,15 +276,11 @@ class DailyStatsScheduler:
             if text != chunk["text"]:
                 changed = True
             filtered.append({"text": text, "header": header, "reports": reports})
-        if len(filtered) == delivery.next_chunk_index:
-            await self.repository.mark_daily_report_delivery_sent(delivery.user_id, delivery.report_date, now.timestamp())
-            return None
         if changed:
             payload = {"chunks": filtered}
             serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             if not await self.repository.replace_daily_report_payload(delivery.user_id, delivery.report_date, serialized):
-                await self._retry(delivery, now, RuntimeError("could not filter daily report payload"))
-                return None
+                raise RuntimeError("could not filter daily report payload")
         return payload
 
     @staticmethod
@@ -298,27 +291,53 @@ class DailyStatsScheduler:
             return False
         return True
 
+    async def _maintain_analytics(self, now: datetime | None = None) -> None:
+        instant = now or self._now()
+        await self.analytics.heartbeat(instant)
+        await self.analytics.cleanup_processed_updates(instant)
+
+    async def _run_maintenance_loop(self) -> None:
+        self._maintenance_stop.clear()
+        while not self._stopping:
+            try:
+                await self._maintain_analytics()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Analytics maintenance cycle failed")
+            if self._stopping:
+                return
+            if await self._maintenance_waiter(self._maintenance_stop, 60):
+                return
+
     async def run_forever(self) -> None:
         self._stopping = False
         # Let polling settle before the first catch-up pass so startup cannot stampede private chats.
         self._startup_stop.clear()
         if await self._startup_waiter(self._startup_stop, 60) or self._stopping:
             return
-        while not self._stopping:
-            try:
-                await self.repository.recover_stuck_daily_report_deliveries(self.clock())
-                await self.run_due_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Daily statistics scheduler cycle failed")
-            if self._stopping:
-                break
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=60)
-            except TimeoutError:
-                pass
+        maintenance_task = asyncio.create_task(self._run_maintenance_loop(), name="analytics-maintenance")
+        try:
+            while not self._stopping:
+                try:
+                    await self.repository.recover_stuck_daily_report_deliveries(self.clock())
+                    await self.run_due_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Daily statistics scheduler cycle failed")
+                if self._stopping:
+                    break
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=60)
+                except TimeoutError:
+                    pass
+        finally:
+            self._maintenance_stop.set()
+            if not maintenance_task.done():
+                maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
 
     def wake(self) -> None:
         self._wake.set()
@@ -326,4 +345,5 @@ class DailyStatsScheduler:
     def stop(self) -> None:
         self._stopping = True
         self._startup_stop.set()
+        self._maintenance_stop.set()
         self._wake.set()

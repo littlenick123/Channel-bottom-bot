@@ -68,6 +68,31 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((stats.joined_count, stats.left_count), (1, 0))
         self.assertFalse(await self.service.record_member_update(11, event(11, joined.date, member("left"), member("member"), channel_id=-1002)))
 
+    async def test_backlogged_pre_activation_event_is_deduplicated_without_changing_counts(self) -> None:
+        activated = datetime(2026, 1, 2, 0, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, activated)
+        stale = event(12, activated - timedelta(minutes=1), member("left"), member("member"))
+
+        self.assertFalse(await self.service.record_member_update(12, stale))
+        self.assertFalse(await self.service.record_member_update(12, stale))
+
+        row = await self.db.fetch_one("SELECT direction, ignored FROM processed_member_updates WHERE update_id=12")
+        self.assertEqual((row["direction"], row["ignored"]), ("join", 1))
+        stats = await self.repo.get_daily_member_stats(-1001, "2026-01-02")
+        self.assertEqual((stats.joined_count, stats.left_count), (0, 0))
+
+    async def test_interruption_marks_every_covered_local_day_when_access_returns(self) -> None:
+        started = datetime(2026, 1, 1, 15, tzinfo=UTC)
+        recovered = datetime(2026, 1, 3, 16, tzinfo=UTC)
+        await self.service.initialize_channel(-1001, started)
+        await self.service.begin_permission_interruption(-1001, started, "bot access lost")
+        await self.service.end_permission_interruption(-1001, recovered)
+
+        rows = [await self.repo.get_daily_member_stats(-1001, day) for day in ("2026-01-01", "2026-01-02", "2026-01-03")]
+        self.assertTrue(all(row is not None and not row.is_complete for row in rows))
+        state = await self.repo.get_analytics_state(-1001)
+        self.assertIsNone(state["interruption_started_at"])
+
     async def test_activation_and_runtime_gaps_mark_every_intersected_date_incomplete(self) -> None:
         start = datetime(2026, 1, 1, 15, tzinfo=UTC)
         await self.service.initialize_channel(-1001, start)

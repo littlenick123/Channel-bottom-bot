@@ -69,7 +69,7 @@ class ChatMembershipService:
             )
             if self.analytics is not None:
                 occurred_at = getattr(event, "date", datetime.now(UTC))
-                await self.analytics.mark_permission_gap(channel_id, occurred_at, occurred_at, "bot access lost")
+                await self.analytics.begin_permission_interruption(channel_id, occurred_at, "bot access lost")
             return
 
         if new_status not in _ADMIN_STATUSES:
@@ -122,8 +122,9 @@ class ChatMembershipService:
         if self.analytics is not None:
             timestamp = activated_at or datetime.now(UTC)
             for channel_id in reconciled.failed_ids:
-                await self.analytics.mark_permission_gap(channel_id, timestamp, timestamp, "chat reconciliation failed")
+                await self.analytics.begin_permission_interruption(channel_id, timestamp, "chat reconciliation failed")
             for identity in reconciled.identities:
                 await self.analytics.initialize_channel(identity.id, timestamp)
                 await self.analytics.refresh_current_count(identity.id, timestamp)
+                await self.analytics.end_permission_interruption(identity.id, timestamp)
         return len(reconciled.identities)
