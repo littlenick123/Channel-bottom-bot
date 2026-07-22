@@ -6,6 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.methods import GetMe
+
 from bottom_post_bot import app
 from bottom_post_bot.config import Settings
 from bottom_post_bot.maintenance import PendingCleanupLoop
@@ -357,6 +360,39 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "dispatcher construction failed"):
                 await app.run(settings)
+        self.assertEqual(events, ["session-closed", "database-closed"])
+
+    async def test_storage_channel_forbidden_has_actionable_error_and_closes_resources(self) -> None:
+        events: list[str] = []
+
+        class FakeDatabase:
+            async def close(self) -> None:
+                events.append("database-closed")
+
+        class FakeSession:
+            async def close(self) -> None:
+                events.append("session-closed")
+
+        class ForbiddenStorageBot:
+            def __init__(self, token: str) -> None:
+                self.session = FakeSession()
+
+            async def get_chat(self, chat_id: int):
+                raise TelegramForbiddenError(GetMe(), "bot is not a member of the channel chat")
+
+        settings = Settings(
+            bot_token="token",
+            storage_channel_id=-100123,
+            operator_user_ids=frozenset({1}),
+        )
+        with (
+            patch.object(app.Database, "open", new=AsyncMock(return_value=FakeDatabase())),
+            patch.object(app, "Bot", ForbiddenStorageBot),
+            patch.object(app, "Dispatcher", lambda: SimpleNamespace()),
+        ):
+            with self.assertRaisesRegex(Exception, "STORAGE_CHANNEL_ID.*管理员"):
+                await app.run(settings)
+
         self.assertEqual(events, ["session-closed", "database-closed"])
 
     async def test_app_wires_daily_stats_with_resolved_bot_identity_and_cleans_it_up_after_polling_error(self) -> None:

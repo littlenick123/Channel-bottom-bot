@@ -118,7 +118,7 @@ docker compose up -d --build --force-recreate
 DATABASE_PATH=data/bot.sqlite3
 ```
 
-#### `Bad Request: chat not found`
+#### `Forbidden: bot is not a member of the channel chat` / `Bad Request: chat not found`
 
 这表示机器人无法访问 `STORAGE_CHANNEL_ID` 指定的草稿存储频道。请确认：
 
@@ -127,7 +127,13 @@ DATABASE_PATH=data/bot.sqlite3
 - `.env` 中填写的是真实频道 ID，而不是 `.env.example` 的示例值；
 - 频道 ID 使用完整的 `-100...` 格式。
 
-检查配置并让容器重新载入 `.env`：
+本地运行时，修正后直接重新启动：
+
+```powershell
+python -m bottom_post_bot
+```
+
+Docker 部署时检查配置并让容器重新载入 `.env`：
 
 ```bash
 grep '^STORAGE_CHANNEL_ID=' .env

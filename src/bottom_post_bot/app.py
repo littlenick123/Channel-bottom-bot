@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import BotCommand
 from dotenv import load_dotenv
 
@@ -31,6 +32,10 @@ from .scheduler import DailyStatsScheduler, RefreshScheduler
 
 
 logger = logging.getLogger(__name__)
+
+
+class StorageChannelAccessError(RuntimeError):
+    """Raised when Telegram denies access to the configured draft storage channel."""
 
 
 def configure_logging(level: str) -> None:
@@ -89,7 +94,14 @@ async def run(settings: Settings) -> None:
     try:
         bot = Bot(token=settings.bot_token)
         dispatcher = Dispatcher()
-        await bot.get_chat(settings.storage_channel_id)
+        try:
+            await bot.get_chat(settings.storage_channel_id)
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise StorageChannelAccessError(
+                f"无法访问 STORAGE_CHANNEL_ID={settings.storage_channel_id}。"
+                "请将机器人添加为该私密频道的管理员，并授予发布消息和删除消息权限；"
+                "同时确认频道 ID 使用完整的 -100... 格式。"
+            ) from exc
         me = await bot.get_me()
         repository = Repository(database)
         recovered_batches = await repository.recover_incomplete_batches(time.time())
@@ -195,7 +207,10 @@ def main() -> None:
     except ConfigurationError as exc:
         raise SystemExit(f"Configuration error: {exc}") from exc
     configure_logging(settings.log_level)
-    asyncio.run(run(settings))
+    try:
+        asyncio.run(run(settings))
+    except StorageChannelAccessError as exc:
+        raise SystemExit(f"Startup error: {exc}") from None
 
 
 if __name__ == "__main__":

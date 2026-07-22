@@ -150,3 +150,19 @@ class StartupEnvironmentTests(unittest.TestCase):
             app.main()
 
         self.assertEqual(order, ["dotenv", "settings"])
+
+    def test_main_renders_storage_channel_startup_error_without_raw_exception(self) -> None:
+        startup_error = getattr(app, "StorageChannelAccessError", RuntimeError)
+
+        def fail_startup(coroutine):
+            coroutine.close()
+            raise startup_error("storage unavailable")
+
+        with (
+            patch.object(app, "load_dotenv"),
+            patch.object(app.Settings, "from_env", return_value=SimpleNamespace(log_level="INFO")),
+            patch.object(app, "configure_logging"),
+            patch.object(app.asyncio, "run", side_effect=fail_startup),
+        ):
+            with self.assertRaisesRegex(SystemExit, "Startup error: storage unavailable"):
+                app.main()
