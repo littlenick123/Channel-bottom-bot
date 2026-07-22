@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -123,6 +124,9 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
             def stop(self) -> None:
                 self._stop.set()
 
+        async def membership_handle(*args) -> None:
+            return None
+
         database = FakeDatabase()
         with tempfile.TemporaryDirectory() as tempdir:
             settings = Settings(
@@ -139,6 +143,18 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app, "Repository", FakeRepository),
                 patch.object(app, "RefreshScheduler", FakeScheduler),
                 patch.object(app, "PendingCleanupLoop", FakeCleanupLoop, create=True),
+                patch.object(
+                    app,
+                    "AnalyticsService",
+                    lambda *args: SimpleNamespace(heartbeat=AsyncMock(), cleanup_processed_updates=AsyncMock()),
+                ),
+                patch.object(
+                    app,
+                    "ChatMembershipService",
+                    lambda *args, **kwargs: SimpleNamespace(
+                        reconcile_managed_chats=AsyncMock(return_value=0), handle=membership_handle
+                    ),
+                ),
             ):
                 await app.run(settings)
 
@@ -252,6 +268,16 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app, "PendingCleanupLoop", FakeLoop),
                 patch.object(app, "BotHandlers", FakeHandlers),
                 patch.object(app, "build_router", return_value=SimpleNamespace()),
+                patch.object(
+                    app,
+                    "AnalyticsService",
+                    lambda *args: SimpleNamespace(heartbeat=AsyncMock(), cleanup_processed_updates=AsyncMock()),
+                ),
+                patch.object(
+                    app,
+                    "ChatMembershipService",
+                    lambda *args, **kwargs: SimpleNamespace(reconcile_managed_chats=AsyncMock(return_value=0)),
+                ),
             ):
                 run_task = asyncio.create_task(app.run(settings))
                 try:
@@ -292,6 +318,143 @@ class PendingCleanupLoopTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertLogs("bottom_post_bot.app", level="ERROR"):
             await app.drain_dispatcher_update_tasks(dispatcher)
+
+    async def test_app_wires_daily_stats_with_resolved_bot_identity_and_cleans_it_up_after_polling_error(self) -> None:
+        """The analytics loop shares the application's startup and shutdown contract."""
+        lifecycle: list[object] = []
+        command_sets: list[list[str]] = []
+        analytics_instances = []
+        handler_analytics = []
+        daily_instances = []
+
+        class FakeDatabase:
+            async def close(self) -> None:
+                lifecycle.append("database-closed")
+
+        class FakeSession:
+            async def close(self) -> None:
+                lifecycle.append("session-closed")
+
+        class FakeBot:
+            def __init__(self, token: str) -> None:
+                self.session = FakeSession()
+
+            async def get_chat(self, chat_id: int) -> None:
+                return None
+
+            async def get_me(self):
+                lifecycle.append("bot-identity-resolved")
+                return SimpleNamespace(id=321)
+
+            async def set_my_commands(self, commands) -> None:
+                command_sets.append([command.command for command in commands])
+
+        class FakeDispatcher:
+            def include_router(self, router) -> None:
+                lifecycle.append("router-included")
+
+            def resolve_used_update_types(self) -> list[str]:
+                return ["message", "chat_member"]
+
+            async def start_polling(self, *args, **kwargs) -> None:
+                lifecycle.append("polling")
+                raise RuntimeError("polling failed")
+
+        class FakeRepository:
+            def __init__(self, database) -> None:
+                return None
+
+            async def recover_incomplete_batches(self, now: float) -> int:
+                return 0
+
+        class FakeAnalytics:
+            def __init__(self, *args) -> None:
+                analytics_instances.append(self)
+
+            async def heartbeat(self, now) -> None:
+                lifecycle.append("analytics-heartbeat")
+
+            async def cleanup_processed_updates(self, now) -> None:
+                lifecycle.append("analytics-cleanup")
+
+        class FakeMembership:
+            def __init__(self, *args, **kwargs) -> None:
+                return None
+
+            async def reconcile_managed_chats(self, *args) -> int:
+                lifecycle.append("reconciled")
+                return 0
+
+        class FakeListener:
+            def __init__(self, repository, scheduler, *, bot_user_id=None) -> None:
+                lifecycle.append(("listener-created", bot_user_id))
+
+        class FakeHandlers:
+            def __init__(self, *args, **kwargs) -> None:
+                handler_analytics.append(kwargs.get("analytics"))
+
+            async def flush_albums(self) -> None:
+                lifecycle.append("albums-flushed")
+
+        class FakeLoop:
+            def __init__(self, *args, **kwargs) -> None:
+                self.stopped = asyncio.Event()
+
+            async def run_forever(self) -> None:
+                await self.stopped.wait()
+
+            def stop(self) -> None:
+                self.stopped.set()
+
+        class FakeDailyStatsScheduler(FakeLoop):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__()
+                daily_instances.append(self)
+
+        database = FakeDatabase()
+        with tempfile.TemporaryDirectory() as tempdir:
+            settings = Settings(
+                bot_token="token",
+                storage_channel_id=-1001,
+                operator_user_ids=frozenset({1}),
+                database_path=Path(tempdir) / "bot.sqlite3",
+            )
+            patches = (
+                patch.object(app.Database, "open", new=AsyncMock(return_value=database)),
+                patch.object(app, "Bot", FakeBot),
+                patch.object(app, "Dispatcher", FakeDispatcher),
+                patch.object(app, "Repository", FakeRepository),
+                patch.object(app, "BotApiGateway", lambda *args: SimpleNamespace()),
+                patch.object(app, "BotApiPermissionGateway", lambda *args, **kwargs: SimpleNamespace()),
+                patch.object(app, "PermissionService", lambda *args: SimpleNamespace()),
+                patch.object(app, "DraftService", lambda *args: SimpleNamespace()),
+                patch.object(app, "PendingDraftService", lambda *args: SimpleNamespace()),
+                patch.object(app, "ChannelService", lambda *args, **kwargs: SimpleNamespace()),
+                patch.object(app, "Publisher", lambda *args: SimpleNamespace()),
+                patch.object(app, "TelegramAdminNotifier", lambda *args: SimpleNamespace()),
+                patch.object(app, "AnalyticsService", FakeAnalytics),
+                patch.object(app, "ChatMembershipService", FakeMembership),
+                patch.object(app, "ChannelListener", FakeListener),
+                patch.object(app, "BotHandlers", FakeHandlers),
+                patch.object(app, "RefreshScheduler", FakeLoop),
+                patch.object(app, "PendingCleanupLoop", FakeLoop),
+                patch.object(app, "DailyStatsScheduler", FakeDailyStatsScheduler, create=True),
+                patch.object(app, "build_router", return_value=SimpleNamespace()),
+            )
+            with ExitStack() as stack:
+                for active_patch in patches:
+                    stack.enter_context(active_patch)
+                with self.assertRaisesRegex(RuntimeError, "polling failed"):
+                    await app.run(settings)
+
+        self.assertEqual(command_sets, [["start", "status", "cancel", "help", "stats"]])
+        self.assertEqual(len(analytics_instances), 1)
+        self.assertEqual(handler_analytics, [analytics_instances[0]])
+        self.assertEqual(len(daily_instances), 1)
+        self.assertTrue(daily_instances[0].stopped.is_set())
+        self.assertLess(lifecycle.index("bot-identity-resolved"), lifecycle.index(("listener-created", 321)))
+        self.assertLess(lifecycle.index("albums-flushed"), lifecycle.index("session-closed"))
+        self.assertLess(lifecycle.index("session-closed"), lifecycle.index("database-closed"))
 
 
 if __name__ == "__main__":

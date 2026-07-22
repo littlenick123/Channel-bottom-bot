@@ -1152,9 +1152,27 @@ class Repository:
             int(row["next_chunk_index"]),
         )
 
-    async def health_counts(self) -> dict[str, int]:
+    async def health_counts(self) -> dict[str, int | float | None]:
         names = ("users", "channels", "drafts", "refresh_jobs")
-        return {name: int(await self.db.fetch_value(f"SELECT COUNT(*) FROM {name}") or 0) for name in names}
+        counts: dict[str, int | float | None] = {
+            name: int(await self.db.fetch_value(f"SELECT COUNT(*) FROM {name}") or 0) for name in names
+        }
+        counts["analytics_incomplete_days"] = int(
+            await self.db.fetch_value("SELECT COUNT(*) FROM member_daily_stats WHERE is_complete=0") or 0
+        )
+        counts["daily_report_deliveries_failed"] = int(
+            await self.db.fetch_value("SELECT COUNT(*) FROM daily_report_deliveries WHERE status IN ('retry', 'terminal')") or 0
+        )
+        counts["daily_report_deliveries_due"] = int(
+            await self.db.fetch_value(
+                "SELECT COUNT(*) FROM daily_report_deliveries WHERE status IN ('pending', 'retry') AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?",
+                (time.time(),),
+            )
+            or 0
+        )
+        heartbeat = await self.get_analytics_heartbeat()
+        counts["analytics_last_heartbeat_at"] = heartbeat
+        return counts
 
     async def list_collectable_storage_ids(self, limit: int = 100) -> list[int]:
         rows = await self.db.fetch_all(

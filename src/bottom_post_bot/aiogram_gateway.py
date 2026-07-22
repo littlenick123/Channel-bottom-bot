@@ -47,9 +47,9 @@ def _entities(value: str) -> list[MessageEntity]:
 
 
 class BotApiPermissionGateway:
-    def __init__(self, bot) -> None:
+    def __init__(self, bot, *, bot_id: int | None = None) -> None:
         self.bot = bot
-        self._bot_id: int | None = None
+        self._bot_id = bot_id
 
     async def resolve_channel(self, reference: str | int) -> ChannelIdentity:
         chat = await self.bot.get_chat(reference)

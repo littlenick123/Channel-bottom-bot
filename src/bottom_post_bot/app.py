@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sys
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -24,7 +26,7 @@ from .pending_drafts import PendingDraftService
 from .permissions import PermissionService
 from .publisher import Publisher
 from .repositories import Repository
-from .scheduler import RefreshScheduler
+from .scheduler import DailyStatsScheduler, RefreshScheduler
 
 
 logger = logging.getLogger(__name__)
@@ -78,11 +80,14 @@ async def run(settings: Settings) -> None:
     dispatcher = Dispatcher()
     scheduler_task: asyncio.Task | None = None
     cleanup_task: asyncio.Task | None = None
+    daily_stats_task: asyncio.Task | None = None
     scheduler: RefreshScheduler | None = None
     cleanup_loop: PendingCleanupLoop | None = None
+    daily_stats_scheduler: DailyStatsScheduler | None = None
     handlers: BotHandlers | None = None
     try:
         await bot.get_chat(settings.storage_channel_id)
+        me = await bot.get_me()
         repository = Repository(database)
         recovered_batches = await repository.recover_incomplete_batches(time.time())
         if recovered_batches:
@@ -90,7 +95,7 @@ async def run(settings: Settings) -> None:
 
         telegram = BotApiGateway(bot, settings.storage_channel_id)
         analytics = AnalyticsService(repository, telegram, settings.stats_timezone)
-        permission_gateway = BotApiPermissionGateway(bot)
+        permission_gateway = BotApiPermissionGateway(bot, bot_id=me.id)
         permissions = PermissionService(repository, permission_gateway)
         drafts = DraftService(repository, telegram, settings.max_drafts_per_user)
         pending_drafts = PendingDraftService(
@@ -111,12 +116,25 @@ async def run(settings: Settings) -> None:
         notifier = TelegramAdminNotifier(bot, repository, permission_gateway)
         scheduler = RefreshScheduler(repository, publisher, notifier=notifier)
         cleanup_loop = PendingCleanupLoop(pending_drafts, settings.pending_cleanup_interval_seconds)
-        handlers = BotHandlers(bot, repository, drafts, channels, permissions, scheduler, telegram, settings, pending_drafts)
-        listener = ChannelListener(repository, scheduler)
+        handlers = BotHandlers(
+            bot, repository, drafts, channels, permissions, scheduler, telegram, settings, pending_drafts, analytics=analytics
+        )
+        listener = ChannelListener(repository, scheduler, bot_user_id=me.id)
         membership = ChatMembershipService(
             repository, channels, notifier, storage_channel_id=settings.storage_channel_id, analytics=analytics
         )
-        await membership.reconcile_managed_chats()
+        startup_now = datetime.now(ZoneInfo(settings.stats_timezone))
+        await analytics.heartbeat(startup_now)
+        await analytics.cleanup_processed_updates(startup_now)
+        await membership.reconcile_managed_chats(startup_now)
+        daily_stats_scheduler = DailyStatsScheduler(
+            repository,
+            analytics,
+            permissions,
+            telegram,
+            timezone=settings.stats_timezone,
+            push_time=settings.stats_push_time,
+        )
         router = build_router(handlers, listener, membership, MemberUpdateAdapter(analytics))
         dispatcher.include_router(router)
 
@@ -126,11 +144,12 @@ async def run(settings: Settings) -> None:
                 BotCommand(command="status", description="查看个人状态"),
                 BotCommand(command="cancel", description="取消当前操作"),
                 BotCommand(command="help", description="查看使用帮助"),
+                BotCommand(command="stats", description="查看成员统计"),
             ]
         )
         scheduler_task = asyncio.create_task(scheduler.run_forever(), name="refresh-scheduler")
         cleanup_task = asyncio.create_task(cleanup_loop.run_forever(), name="pending-cleanup")
-        me = await bot.get_me()
+        daily_stats_task = asyncio.create_task(daily_stats_scheduler.run_forever(), name="daily-stats-scheduler")
         logger.info("Bot started", extra={"bot_id": me.id})
         await dispatcher.start_polling(
             bot,
@@ -147,7 +166,9 @@ async def run(settings: Settings) -> None:
             cleanup_loop.stop()
         if scheduler is not None:
             scheduler.stop()
-        tasks = [task for task in (cleanup_task, scheduler_task) if task is not None]
+        if daily_stats_scheduler is not None:
+            daily_stats_scheduler.stop()
+        tasks = [task for task in (daily_stats_task, cleanup_task, scheduler_task) if task is not None]
         for task in tasks:
             if not task.done():
                 task.cancel()

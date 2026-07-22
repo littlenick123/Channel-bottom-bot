@@ -125,4 +125,5 @@ class ChatMembershipService:
                 await self.analytics.mark_permission_gap(channel_id, timestamp, timestamp, "chat reconciliation failed")
             for identity in reconciled.identities:
                 await self.analytics.initialize_channel(identity.id, timestamp)
+                await self.analytics.refresh_current_count(identity.id, timestamp)
         return len(reconciled.identities)

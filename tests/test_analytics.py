@@ -137,6 +137,20 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         await self.repo.mark_daily_report_delivery_sent(7, "2026-01-02", 201.0)
         self.assertEqual(await self.repo.list_due_daily_report_deliveries(999.0), [])
 
+    async def test_health_counts_include_analytics_integrity_delivery_failures_and_heartbeat(self) -> None:
+        await self.service.initialize_channel(-1001, datetime(2026, 1, 1, 15, tzinfo=UTC))
+        await self.repo.set_analytics_heartbeat(123.0)
+        await self.repo.reserve_daily_report_delivery(7, "2026-01-02", 0.0)
+        await self.repo.claim_daily_report_delivery(7, "2026-01-02", 0.0)
+        await self.repo.record_daily_report_delivery_failure(7, "2026-01-02", "offline", 0.0)
+
+        counts = await self.repo.health_counts()
+
+        self.assertEqual(counts["analytics_incomplete_days"], 1)
+        self.assertEqual(counts["daily_report_deliveries_failed"], 1)
+        self.assertEqual(counts["daily_report_deliveries_due"], 1)
+        self.assertEqual(counts["analytics_last_heartbeat_at"], 123.0)
+
     async def test_stats_subscriptions_are_independent_and_respect_report_cutoff(self) -> None:
         await self.repo.upsert_user(8, "Bob")
         await self.repo.bind_manager(8, -1001, 10)

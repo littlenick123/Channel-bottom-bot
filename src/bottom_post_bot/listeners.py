@@ -42,16 +42,19 @@ def _is_user_content(event) -> bool:
 
 
 class ChannelListener:
-    def __init__(self, repository, scheduler) -> None:
+    def __init__(self, repository, scheduler, *, bot_user_id: int | None = None) -> None:
         self.repository = repository
         self.scheduler = scheduler
+        self.bot_user_id = bot_user_id
 
     async def handle(self, event) -> None:
         wrapped = getattr(event, "message", None)
         if getattr(event, "out", False) or getattr(wrapped, "action", None) is not None:
             return
         author = getattr(event, "from_user", None)
-        if author is not None and getattr(author, "is_bot", False):
+        if author is not None and (
+            getattr(author, "is_bot", False) or self.bot_user_id is not None and int(getattr(author, "id", 0)) == self.bot_user_id
+        ):
             return
         if not _is_user_content(event):
             return
