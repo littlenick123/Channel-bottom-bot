@@ -4,10 +4,15 @@ import asyncio
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import datetime, time as clock_time
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
+from .analytics import AnalyticsService
+from .permissions import PermissionDenied
 from .publisher import FloodWaitSignal, RefreshOutcome
 from .repositories import Repository
+from .stats import format_chat_report, split_chat_reports
 
 
 BACKOFF_SECONDS = (5, 15, 60, 300, 900)
@@ -19,6 +24,14 @@ class RefreshPublisher(Protocol):
 
 class AdminNotifier(Protocol):
     async def notify_channel_admins(self, channel_id: int, text: str) -> None: ...
+
+
+class PrivateDeliveryError(RuntimeError):
+    """A private chat cannot accept reports until the user changes Telegram settings."""
+
+
+class DailyReportDeliveryGateway(Protocol):
+    async def send_private_text(self, user_id: int, text: str) -> None: ...
 
 
 class RefreshScheduler:
@@ -98,6 +111,117 @@ class RefreshScheduler:
                 await asyncio.wait_for(self._wake.wait(), timeout=timeout)
             except TimeoutError:
                 pass
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._wake.set()
+
+
+DAILY_REPORT_RETRY_SECONDS = (60, 300, 900, 3600)
+
+
+class DailyStatsScheduler:
+    """Schedules one consolidated, permission-checked daily report for each manager."""
+
+    def __init__(
+        self,
+        repository: Repository,
+        analytics: AnalyticsService,
+        permissions,
+        delivery_gateway: DailyReportDeliveryGateway,
+        *,
+        timezone: ZoneInfo | str = "Asia/Shanghai",
+        push_time: clock_time = clock_time(0, 5),
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.repository = repository
+        self.analytics = analytics
+        self.permissions = permissions
+        self.delivery_gateway = delivery_gateway
+        self.timezone = ZoneInfo(timezone) if isinstance(timezone, str) else timezone
+        self.push_time = push_time
+        self.clock = clock
+        self._wake = asyncio.Event()
+        self._stopping = False
+
+    def _now(self) -> datetime:
+        return datetime.fromtimestamp(self.clock(), self.timezone)
+
+    def report_cutoff(self, instant: datetime) -> datetime:
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=ZoneInfo("UTC"))
+        local = instant.astimezone(self.timezone)
+        return datetime.combine(local.date(), self.push_time, tzinfo=self.timezone)
+
+    @staticmethod
+    def _utc_db_timestamp(instant: datetime) -> str:
+        return instant.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
+
+    async def run_due_once(self, instant: datetime | None = None) -> None:
+        now = instant.astimezone(self.timezone) if instant is not None else self._now()
+        now_timestamp = now.timestamp()
+        await self.analytics.heartbeat(now)
+        await self.analytics.cleanup_processed_updates(now)
+        cutoff = self.report_cutoff(now)
+        if now >= cutoff:
+            report_date = cutoff.date().isoformat()
+            cutoff_utc = self._utc_db_timestamp(cutoff)
+            for user_id in await self.repository.list_daily_report_manager_ids(cutoff_utc):
+                await self.repository.reserve_daily_report_delivery(user_id, report_date, cutoff.timestamp())
+        deliveries = await self.repository.list_due_daily_report_deliveries(now_timestamp)
+        for delivery in deliveries:
+            await self._deliver(delivery, now)
+
+    async def _deliver(self, delivery, now: datetime) -> None:
+        claimed = await self.repository.claim_daily_report_delivery(delivery.user_id, delivery.report_date, now.timestamp())
+        if claimed is None:
+            return
+        cutoff = datetime.combine(datetime.fromisoformat(claimed.report_date).date(), self.push_time, tzinfo=self.timezone)
+        chat_ids = await self.repository.list_user_stats_subscription_ids(claimed.user_id, self._utc_db_timestamp(cutoff))
+        reports = []
+        for chat_id in chat_ids:
+            try:
+                await self.permissions.assert_user_can_manage(claimed.user_id, chat_id)
+                reports.append(format_chat_report(await self.analytics.get_chat_report(claimed.user_id, chat_id, now), timezone=self.timezone))
+            except PermissionDenied:
+                continue
+        if not reports:
+            await self.repository.mark_daily_report_delivery_sent(claimed.user_id, claimed.report_date, now.timestamp())
+            return
+        try:
+            for text in split_chat_reports(reports, header=f"📈 每日成员统计（{claimed.report_date}）"):
+                await self.delivery_gateway.send_private_text(claimed.user_id, text)
+        except PrivateDeliveryError as exc:
+            await self.repository.mark_daily_report_delivery_terminal(claimed.user_id, claimed.report_date, str(exc))
+        except Exception as exc:
+            delay = DAILY_REPORT_RETRY_SECONDS[min(claimed.attempts - 1, len(DAILY_REPORT_RETRY_SECONDS) - 1)]
+            await self.repository.record_daily_report_delivery_failure(
+                claimed.user_id, claimed.report_date, str(exc), now.timestamp() + delay
+            )
+        else:
+            await self.repository.mark_daily_report_delivery_sent(claimed.user_id, claimed.report_date, now.timestamp())
+
+    async def run_forever(self) -> None:
+        self._stopping = False
+        # Let polling settle before the first catch-up pass so startup cannot stampede private chats.
+        self._wake.clear()
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=60)
+        except TimeoutError:
+            pass
+        if self._stopping:
+            return
+        await self.repository.recover_stuck_daily_report_deliveries(self.clock())
+        while not self._stopping:
+            await self.run_due_once()
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=60)
+            except TimeoutError:
+                pass
+
+    def wake(self) -> None:
+        self._wake.set()
 
     def stop(self) -> None:
         self._stopping = True

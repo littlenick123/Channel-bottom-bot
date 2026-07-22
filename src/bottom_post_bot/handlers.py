@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Sequence
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -15,6 +17,7 @@ from .drafts import DraftService, IncomingContent
 from .pending_drafts import PendingDraftService
 from .permissions import PermissionDenied, PermissionService, PermissionUnavailable
 from .repositories import AuthorizationError, Repository, ResourceLimitError
+from .stats import format_chat_report
 
 
 logger = logging.getLogger(__name__)
@@ -132,6 +135,7 @@ class BotHandlers:
         gateway,
         settings: Settings,
         pending_drafts: PendingDraftService,
+        analytics=None,
     ) -> None:
         self.bot = bot
         self.repository = repository
@@ -142,6 +146,7 @@ class BotHandlers:
         self.gateway = gateway
         self.settings = settings
         self.pending_drafts = pending_drafts
+        self.analytics = analytics
         self._album_messages: dict[tuple[int, str], list[Message]] = {}
         self._album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 
@@ -179,6 +184,9 @@ class BotHandlers:
             return
         if command == "/status":
             await self.show_status(message, user_id)
+            return
+        if command == "/stats":
+            await self.show_stats(message, user_id)
             return
         if command == "/health":
             await self.show_health(message, user_id)
@@ -320,11 +328,24 @@ class BotHandlers:
             await self._show(event, "确认删除个人草稿？已发布的频道快照不会受影响。", [[_cb("确认删除", f"d:delete_confirm:{draft_id}"), _cb("取消", f"d:view:{draft_id}")]])
         elif data == "c":
             await self._show_channels(event, user_id)
+        elif data == "s":
+            await self.show_stats(event, user_id)
+        elif data.startswith("s:v:"):
+            await self._show_stats_chat(event, user_id, int(data.rsplit(":", 1)[1]))
+        elif data.startswith("s:t:"):
+            _, _, channel_id, enabled = data.split(":")
+            channel_id = int(channel_id)
+            await self.permissions.assert_user_can_manage(user_id, channel_id)
+            if not await self.repository.set_manager_stats_push_enabled(user_id, channel_id, enabled == "1"):
+                raise AuthorizationError("频道绑定已失效")
+            await self._show_stats_chat(event, user_id, channel_id)
         elif data == "c:bind":
             await self._set_state(user_id, "await_channel", {})
             await self._show(event, "请发送频道 @username、-100 开头的 ID，或转发一条频道帖子。")
         elif data.startswith("c:view:"):
             await self._show_channel(event, user_id, int(data.rsplit(":", 1)[1]))
+        elif data.startswith("c:stats:"):
+            await self._show_stats_chat(event, user_id, int(data.rsplit(":", 1)[1]))
         elif data.startswith("c:slot_name:"):
             _, _, channel_id, slot = data.split(":")
             await self.permissions.assert_user_can_manage(user_id, int(channel_id))
@@ -534,6 +555,35 @@ class BotHandlers:
         rows.extend([[_cb("➕ 绑定频道", "c:bind")], [_cb("返回", "m")]])
         await self._show(event, f"我的频道（{len(channels)}/{self.settings.max_channels_per_user}）", rows)
 
+    def _stats_timezone(self) -> ZoneInfo:
+        return ZoneInfo(getattr(self.settings, "stats_timezone", "Asia/Shanghai"))
+
+    async def show_stats(self, event, user_id: int) -> None:
+        if self.analytics is None:
+            raise PermissionDenied("成员统计服务暂未启动")
+        channels = await self.repository.list_user_channels(user_id)
+        if not channels:
+            await self._show(event, "尚未绑定频道或超级群组。", [[_cb("返回", "m")]])
+        elif len(channels) == 1:
+            await self._show_stats_chat(event, user_id, int(channels[0]["id"]))
+        else:
+            rows = [[_cb(f"📊 {str(row['title'])[:30]}", f"s:v:{int(row['id'])}")] for row in channels]
+            rows.append([_cb("返回", "m")])
+            await self._show(event, "请选择要查看成员统计的频道或超级群组：", rows)
+
+    async def _show_stats_chat(self, event, user_id: int, channel_id: int) -> None:
+        if self.analytics is None:
+            raise PermissionDenied("成员统计服务暂未启动")
+        await self.permissions.assert_user_can_manage(user_id, channel_id)
+        report = await self.analytics.get_chat_report(user_id, channel_id, datetime.now(self._stats_timezone()))
+        toggle_to = 0 if report.stats_push_enabled else 1
+        label = "关闭每日推送" if report.stats_push_enabled else "开启每日推送"
+        await self._show(
+            event,
+            format_chat_report(report, timezone=self._stats_timezone()),
+            [[_cb(label, f"s:t:{channel_id}:{toggle_to}")], [_cb("返回统计列表", "s"), _cb("返回频道", f"c:view:{channel_id}")]],
+        )
+
     async def _show_channel(self, event, user_id: int, channel_id: int) -> None:
         await self.permissions.assert_user_can_manage(user_id, channel_id)
         channel = await self.repository.get_channel(channel_id)
@@ -564,6 +614,7 @@ class BotHandlers:
         for slot in slots:
             rows.append([_cb(f"{'停用' if slot.enabled else '启用'} {slot.slot_number}号", f"c:slot_toggle:{channel_id}:{slot.slot_number}:{0 if slot.enabled else 1}"), _cb(f"改名 {slot.slot_number}号", f"c:slot_name:{channel_id}:{slot.slot_number}"), _cb(f"清空 {slot.slot_number}号", f"c:slot_clear:{channel_id}:{slot.slot_number}"), _cb(f"移动 {slot.slot_number}号", f"c:slot_move:{channel_id}:{slot.slot_number}")])
         rows.extend([[_cb("立即刷新", f"c:refresh:{channel_id}"), _cb("修改延迟", f"c:delay:{channel_id}")], [_cb("改为通知" if channel["silent"] else "改为静默", f"c:silent:{channel_id}:{0 if channel['silent'] else 1}"), _cb("关闭" if channel["enabled"] else "开启", f"c:enabled:{channel_id}:{0 if channel['enabled'] else 1}")]])
+        rows.append([_cb("成员统计", f"c:stats:{channel_id}")])
         if channel["status"] == "paused":
             rows.append([_cb("检查权限并恢复", f"c:resume:{channel_id}")])
         rows.extend([[_cb("退出管理", f"c:leave:{channel_id}"), _cb("删除共享配置", f"c:delete:{channel_id}")], [_cb("返回频道列表", "c")]])

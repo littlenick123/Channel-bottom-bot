@@ -29,6 +29,7 @@ from .domain import ButtonSpec, ContentItem
 from .drafts import IncomingContent
 from .permissions import BotCapabilities, PermissionUnavailable
 from .publisher import FloodWaitSignal, PermanentPublishError
+from .scheduler import PrivateDeliveryError
 
 
 TRANSIENT_ERRORS = (TelegramNetworkError, TelegramServerError)
@@ -98,6 +99,16 @@ class BotApiGateway:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
             raise PermanentPublishError(f"无法获取成员数：{exc}") from exc
+
+    async def send_private_text(self, user_id: int, text: str) -> None:
+        try:
+            await self.bot.send_message(chat_id=user_id, text=text, disable_notification=True)
+        except TelegramRetryAfter as exc:
+            raise FloodWaitSignal(exc.retry_after) from exc
+        except (TelegramForbiddenError, TelegramBadRequest) as exc:
+            raise PrivateDeliveryError(f"private report delivery unavailable: {exc}") from exc
+        except TRANSIENT_ERRORS:
+            raise
 
     async def copy_messages(self, messages: Sequence[IncomingContent]) -> list[int]:
         if not messages:

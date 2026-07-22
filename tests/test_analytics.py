@@ -137,6 +137,15 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
         await self.repo.mark_daily_report_delivery_sent(7, "2026-01-02", 201.0)
         self.assertEqual(await self.repo.list_due_daily_report_deliveries(999.0), [])
 
+    async def test_stats_subscriptions_are_independent_and_respect_report_cutoff(self) -> None:
+        await self.repo.upsert_user(8, "Bob")
+        await self.repo.bind_manager(8, -1001, 10)
+        await self.repo.set_manager_stats_push_enabled(7, -1001, False)
+
+        self.assertEqual(await self.repo.list_daily_report_manager_ids("2999-01-01 00:05:00"), [8])
+        self.assertEqual(await self.repo.list_user_stats_subscription_ids(8, "2999-01-01 00:05:00"), [-1001])
+        self.assertEqual(await self.repo.list_user_stats_subscription_ids(7, "2999-01-01 00:05:00"), [])
+
     async def test_legacy_channel_upsert_preserves_stored_type_but_explicit_type_updates_it(self) -> None:
         await self.repo.upsert_channel(-1001, "News", "news", chat_type="supergroup")
         await self.repo.upsert_channel(-1001, "Renamed", "news")

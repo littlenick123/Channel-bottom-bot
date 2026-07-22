@@ -1,9 +1,10 @@
 import json
 import unittest
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bottom_post_bot.domain import ContentItem, Draft, DraftRevision, PendingDraft, SlotSnapshot
+from bottom_post_bot.domain import ContentItem, DailyMemberStats, Draft, DraftRevision, MemberStatsReport, PendingDraft, SlotSnapshot
 from bottom_post_bot.handlers import BotHandlers, message_to_incoming
 from bottom_post_bot.permissions import PermissionUnavailable
 from bottom_post_bot.repositories import AuthorizationError, ResourceLimitError
@@ -460,6 +461,50 @@ class ChannelSlotNameHandlerTests(unittest.IsolatedAsyncioTestCase):
         callback_data = [button.callback_data for row in rows for button in row]
         self.assertIn(f"c:slot_name:{channel_id}:1", callback_data)
         self.assertTrue(all(len(data.encode("utf-8")) <= 64 for data in callback_data))
+
+
+class StatsHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.repository = FakeRepository()
+        self.repository.list_user_channels = AsyncMock(return_value=[{"id": -1007, "title": "News"}])
+        self.repository.get_manager_stats_push_enabled = AsyncMock(return_value=True)
+        self.repository.set_manager_stats_push_enabled = AsyncMock(return_value=True)
+        self.permissions = SimpleNamespace(assert_user_can_manage=AsyncMock())
+        report = MemberStatsReport(
+            -1007, "News", "channel", 99, None,
+            DailyMemberStats(date(2026, 1, 2), 2, 1),
+            DailyMemberStats(date(2026, 1, 1)), True,
+        )
+        self.analytics = SimpleNamespace(get_chat_report=AsyncMock(return_value=report))
+        self.handlers = BotHandlers(
+            SimpleNamespace(), self.repository, FakeDraftService(), SimpleNamespace(), self.permissions,
+            SimpleNamespace(), FakeGateway(),
+            SimpleNamespace(conversation_timeout_seconds=900, max_drafts_per_user=50, max_slots_per_channel=3, operator_user_ids=frozenset(), stats_timezone="Asia/Shanghai"),
+            pending_drafts=FakePendingDrafts(), analytics=self.analytics,
+        )
+
+    async def test_single_stats_chat_is_authorized_and_rendered_directly(self) -> None:
+        self.handlers._show = AsyncMock()
+
+        await self.handlers.show_stats(SimpleNamespace(), 42)
+
+        self.permissions.assert_user_can_manage.assert_awaited_once_with(42, -1007)
+        self.assertIn("当前成员：99", self.handlers._show.await_args.args[1])
+
+    async def test_multiple_stats_chats_show_short_selector_and_toggle_is_per_manager(self) -> None:
+        channel_id = -1001234567890
+        self.repository.list_user_channels.return_value = [{"id": channel_id, "title": "A"}, {"id": -1008, "title": "B"}]
+        self.handlers._show = AsyncMock()
+
+        await self.handlers.show_stats(SimpleNamespace(), 42)
+        rows = self.handlers._show.await_args.args[2]
+        callbacks = [button.callback_data for row in rows for button in row]
+        self.assertTrue(all(len(data.encode("utf-8")) <= 64 for data in callbacks))
+        self.assertIn(f"s:v:{channel_id}", callbacks)
+
+        await self.handlers._dispatch_callback(SimpleNamespace(), 42, f"s:t:{channel_id}:0")
+        self.permissions.assert_user_can_manage.assert_awaited_with(42, channel_id)
+        self.repository.set_manager_stats_push_enabled.assert_awaited_once_with(42, channel_id, False)
 
 
 class AiogramMessageConversionTests(unittest.TestCase):

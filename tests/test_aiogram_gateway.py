@@ -9,6 +9,7 @@ from bottom_post_bot.domain import ButtonSpec, ContentItem
 from bottom_post_bot.drafts import IncomingContent
 from bottom_post_bot.permissions import PermissionUnavailable
 from bottom_post_bot.publisher import FloodWaitSignal, PermanentPublishError
+from bottom_post_bot.scheduler import PrivateDeliveryError
 
 
 class FakeBot:
@@ -77,6 +78,15 @@ class FakeBot:
 
 
 class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_report_text_maps_blocked_delivery_to_terminal_error(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        await gateway.send_private_text(42, "report")
+        self.assertEqual(bot.message_calls[-1]["chat_id"], 42)
+
+        bot.send_error = TelegramForbiddenError(method=GetMe(), message="blocked")
+        with self.assertRaises(PrivateDeliveryError):
+            await gateway.send_private_text(42, "report")
     async def test_copy_messages_stores_album_in_one_bot_api_call(self) -> None:
         bot = FakeBot()
         gateway = BotApiGateway(bot, storage_channel_id=-10050)

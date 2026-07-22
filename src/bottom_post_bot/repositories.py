@@ -872,6 +872,24 @@ class Repository:
             )
             return cursor.rowcount > 0
 
+    async def list_daily_report_manager_ids(self, cutoff_utc: str) -> list[int]:
+        """Users with at least one opted-in chat bound before the local report cutoff."""
+        rows = await self.db.fetch_all(
+            """SELECT DISTINCT user_id FROM channel_managers
+               WHERE stats_push_enabled=1 AND bound_at <= ? ORDER BY user_id""",
+            (cutoff_utc,),
+        )
+        return [int(row["user_id"]) for row in rows]
+
+    async def list_user_stats_subscription_ids(self, user_id: int, cutoff_utc: str) -> list[int]:
+        rows = await self.db.fetch_all(
+            """SELECT channel_id FROM channel_managers
+               WHERE user_id=? AND stats_push_enabled=1 AND bound_at <= ?
+               ORDER BY channel_id""",
+            (user_id, cutoff_utc),
+        )
+        return [int(row["channel_id"]) for row in rows]
+
     async def initialize_analytics(self, channel_id: int, started_at: float, stat_date: str) -> bool:
         """Create collection state once and flag the partial activation day."""
         async with self.db.transaction() as connection:
@@ -1068,6 +1086,28 @@ class Repository:
                 (sent_at, user_id, report_date),
             )
             return cursor.rowcount > 0
+
+    async def mark_daily_report_delivery_terminal(self, user_id: int, report_date: str, error: str) -> bool:
+        """Stop retrying a report that cannot be delivered to this private chat."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries
+                   SET status='terminal', next_attempt_at=NULL, last_error=?
+                   WHERE user_id=? AND report_date=? AND status='sending'""",
+                (error[:1000], user_id, report_date),
+            )
+            return cursor.rowcount > 0
+
+    async def recover_stuck_daily_report_deliveries(self, now: float) -> int:
+        """Make deliveries left in sending state by a terminated process due again."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries
+                   SET status='retry', next_attempt_at=?, last_error=COALESCE(last_error, 'recovered interrupted delivery')
+                   WHERE status='sending'""",
+                (now,),
+            )
+            return cursor.rowcount
 
     @staticmethod
     def _daily_report_delivery(row) -> DailyReportDelivery:
