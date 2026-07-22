@@ -1,5 +1,42 @@
 from __future__ import annotations
 
+from aiogram.enums import ContentType
+
+
+_USER_CONTENT_TYPES = frozenset(
+    {
+        ContentType.TEXT,
+        ContentType.ANIMATION,
+        ContentType.AUDIO,
+        ContentType.DOCUMENT,
+        ContentType.LIVE_PHOTO,
+        ContentType.PAID_MEDIA,
+        ContentType.PHOTO,
+        ContentType.STICKER,
+        ContentType.STORY,
+        ContentType.VIDEO,
+        ContentType.VIDEO_NOTE,
+        ContentType.VOICE,
+        ContentType.CHECKLIST,
+        ContentType.CONTACT,
+        ContentType.DICE,
+        ContentType.GAME,
+        ContentType.POLL,
+        ContentType.VENUE,
+        ContentType.LOCATION,
+    }
+)
+
+
+def _is_user_content(event) -> bool:
+    """Accept only known user message types; unknown and service types cannot trigger a refresh."""
+    content_type = getattr(event, "content_type", None)
+    if content_type is None:
+        # Compatibility with the legacy listener shape, which has no aiogram content-type field.
+        return True
+    value = getattr(content_type, "value", content_type)
+    return value in _USER_CONTENT_TYPES
+
 
 class ChannelListener:
     def __init__(self, repository, scheduler) -> None:
@@ -13,10 +50,7 @@ class ChannelListener:
         author = getattr(event, "from_user", None)
         if author is not None and getattr(author, "is_bot", False):
             return
-        if any(
-            getattr(event, field, None) is not None
-            for field in ("new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo", "group_chat_created", "supergroup_chat_created", "channel_chat_created", "pinned_message", "migrate_to_chat_id", "migrate_from_chat_id")
-        ):
+        if not _is_user_content(event):
             return
         chat = getattr(event, "chat", None)
         channel_id = int(chat.id if chat is not None else event.chat_id)

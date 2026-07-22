@@ -118,9 +118,11 @@ class ChatMembershipService:
 
     async def reconcile_managed_chats(self, activated_at: datetime | None = None) -> int:
         """Refresh persisted Telegram chat identities when the process starts."""
-        identities = await self.channels.reconcile_managed_chats()
+        reconciled = await self.channels.reconcile_managed_chats()
         if self.analytics is not None:
             timestamp = activated_at or datetime.now(UTC)
-            for identity in identities:
+            for channel_id in reconciled.failed_ids:
+                await self.analytics.mark_permission_gap(channel_id, timestamp, timestamp, "chat reconciliation failed")
+            for identity in reconciled.identities:
                 await self.analytics.initialize_channel(identity.id, timestamp)
-        return len(identities)
+        return len(reconciled.identities)

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 from .permissions import PermissionDenied, PermissionService
 from .repositories import Repository
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +16,12 @@ class ChannelIdentity:
     title: str
     username: str | None
     chat_type: str = "channel"
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciledChats:
+    identities: tuple[ChannelIdentity, ...]
+    failed_ids: tuple[int, ...]
 
 
 class ChannelService:
@@ -54,18 +64,28 @@ class ChannelService:
             await self.repository.audit(channel.id, user_id, "channel.bind", {})
         return channel, created
 
-    async def reconcile_managed_chats(self) -> list[ChannelIdentity]:
+    async def reconcile_managed_chats(self) -> ReconciledChats:
         """Re-read Telegram identities for managed chats, retaining their configured options."""
         reconciled: list[ChannelIdentity] = []
+        failed_ids: list[int] = []
         for row in await self.repository.list_managed_channels():
-            channel = await self.permissions.gateway.resolve_channel(int(row["id"]))
+            channel_id = int(row["id"])
+            try:
+                channel = await self.permissions.gateway.resolve_channel(channel_id)
+            except Exception as exc:
+                failed_ids.append(channel_id)
+                logger.warning(
+                    "Managed chat reconciliation failed",
+                    extra={"channel_id": channel_id, "error_type": type(exc).__name__},
+                )
+                continue
             if channel.id == self.storage_channel_id:
                 continue
             await self.repository.upsert_channel(
                 channel.id, channel.title, channel.username, int(row["refresh_delay_seconds"]), channel.chat_type
             )
             reconciled.append(channel)
-        return reconciled
+        return ReconciledChats(tuple(reconciled), tuple(failed_ids))
 
     async def assign_slot(self, channel_id: int, slot_number: int, revision_id: int, actor_id: int) -> None:
         await self.permissions.assert_user_can_manage(actor_id, channel_id)

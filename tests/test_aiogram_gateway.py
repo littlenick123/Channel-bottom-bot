@@ -191,6 +191,21 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
         capabilities = await BotApiPermissionGateway(bot).bot_capabilities(-1007)
         self.assertEqual((capabilities.is_admin, capabilities.can_send, capabilities.can_delete), (True, False, True))
 
+    async def test_channel_bot_capabilities_require_can_post_messages_for_administrators(self) -> None:
+        bot = FakeBot()
+
+        class Member:
+            status = "administrator"
+            can_post_messages = False
+            can_delete_messages = True
+
+        async def get_chat_member(chat_id, user_id):
+            return Member()
+
+        bot.get_chat_member = get_chat_member
+        capabilities = await BotApiPermissionGateway(bot).bot_capabilities(-1007)
+        self.assertEqual((capabilities.is_admin, capabilities.can_send, capabilities.can_delete), (True, False, True))
+
     async def test_get_member_count_translates_retry_permanent_and_transient_errors(self) -> None:
         bot = FakeBot()
         gateway = BotApiGateway(bot, storage_channel_id=-10050)

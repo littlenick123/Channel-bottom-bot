@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from aiogram import Dispatcher
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import GetMe
 
 from bottom_post_bot.aiogram_gateway import BotApiPermissionGateway
@@ -185,6 +185,33 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
         chat = await self.repository.get_channel(-1007)
         self.assertEqual((chat["title"], chat["username"], chat["chat_type"]), ("Group", "group", "supergroup"))
         self.assertIsNotNone(await self.repository.get_analytics_state(-1007))
+
+    async def test_startup_reconciliation_continues_after_each_chat_lookup_failure_and_marks_gaps(self) -> None:
+        failures = {
+            -1008: TelegramForbiddenError(GetMe(), "bot removed"),
+            -1009: TelegramBadRequest(GetMe(), "chat deleted"),
+            -1010: TelegramNetworkError(GetMe(), "offline"),
+            -1011: ValueError("legacy basic group"),
+        }
+        for user_id, channel_id in enumerate((-1007, -1008, -1009, -1010, -1011), start=1):
+            await self.repository.upsert_user(user_id, f"Manager {user_id}")
+            await self.repository.upsert_channel(channel_id, f"Chat {user_id}", None)
+            await self.repository.bind_manager(user_id, channel_id, max_channels=1)
+
+        async def resolve_channel(channel_id):
+            if channel_id in failures:
+                raise failures[channel_id]
+            return ChannelIdentity(-1007, "Reconciled", "reconciled", "supergroup")
+
+        self.gateway.resolve_channel = resolve_channel
+        activated_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+        self.assertEqual(await self.membership.reconcile_managed_chats(activated_at), 1)
+        self.assertEqual((await self.repository.get_channel(-1007))["chat_type"], "supergroup")
+        for channel_id in failures:
+            row = await self.repository.get_daily_member_stats(channel_id, "2026-01-02")
+            self.assertIsNotNone(row)
+            self.assertFalse(row.is_complete)
 
     async def test_non_admin_actor_records_channel_and_audits_without_manager_or_pause(self) -> None:
         self.gateway.user_admin = False

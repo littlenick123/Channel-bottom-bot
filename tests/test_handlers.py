@@ -110,7 +110,7 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepts_aiogram_channel_post_shape(self) -> None:
         scheduler = FakeScheduler()
         listener = ChannelListener(FakeRepository(), scheduler)
-        message = SimpleNamespace(chat=SimpleNamespace(id=-1007), message_id=22)
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1007), message_id=22, content_type="text")
         await listener.handle(message)
         self.assertEqual(scheduler.calls, [(-1007, "channel-message:22", 10)])
 
@@ -118,11 +118,36 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
         scheduler = FakeScheduler()
         listener = ChannelListener(FakeRepository(), scheduler)
         base = dict(chat=SimpleNamespace(id=-1007), message_id=22)
-        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=False)))
+        await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=False), content_type="text"))
         await listener.handle(SimpleNamespace(**base, from_user=SimpleNamespace(is_bot=True)))
-        await listener.handle(SimpleNamespace(**base, new_chat_members=[SimpleNamespace(id=1)]))
+        await listener.handle(
+            SimpleNamespace(**base, new_chat_members=[SimpleNamespace(id=1)], content_type="new_chat_members")
+        )
 
         self.assertEqual(scheduler.calls, [(-1007, "channel-message:22", 10)])
+
+    async def test_rejects_every_representative_aiogram_service_content_type(self) -> None:
+        scheduler = FakeScheduler()
+        listener = ChannelListener(FakeRepository(), scheduler)
+        for content_type in (
+            "forum_topic_created",
+            "video_chat_started",
+            "message_auto_delete_timer_changed",
+            "boost_added",
+            "general_forum_topic_hidden",
+            "suggested_post_paid",
+        ):
+            with self.subTest(content_type=content_type):
+                await listener.handle(
+                    SimpleNamespace(
+                        chat=SimpleNamespace(id=-1007),
+                        message_id=22,
+                        from_user=SimpleNamespace(is_bot=False),
+                        content_type=content_type,
+                    )
+                )
+
+        self.assertEqual(scheduler.calls, [])
 
 
 if __name__ == "__main__":

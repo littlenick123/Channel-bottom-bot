@@ -13,7 +13,7 @@ class PermissionDenied(PermissionError):
 class PermissionUnavailable(PermissionDenied):
     """Raised when Telegram cannot reliably determine current permissions."""
 
-    public_message = "暂时无法确认频道管理员权限，请稍后重试"
+    public_message = "暂时无法确认频道或超级群组的管理员权限，请稍后重试"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,10 @@ class PermissionService:
         self.repository = repository
         self.gateway = gateway
 
+    async def _chat_label(self, channel_id: int) -> str:
+        channel = await self.repository.get_channel(channel_id)
+        return "超级群组" if channel is not None and channel["chat_type"] == "supergroup" else "频道"
+
     async def assert_can_bind(self, user_id: int, reference: str | int):
         channel = await self.gateway.resolve_channel(reference)
         label = "超级群组" if getattr(channel, "chat_type", "channel") == "supergroup" else "频道"
@@ -51,13 +55,12 @@ class PermissionService:
         return channel
 
     async def assert_user_can_manage(self, user_id: int, channel_id: int) -> None:
+        label = await self._chat_label(channel_id)
         if not await self.repository.is_bound_manager(user_id, channel_id):
-            raise PermissionDenied("你尚未绑定此频道")
+            raise PermissionDenied(f"你尚未绑定此{label}")
         if not await self.gateway.user_is_admin(channel_id, user_id):
             await self.repository.unbind_manager(user_id, channel_id)
-            raise PermissionDenied("你的频道管理员权限已失效")
+            raise PermissionDenied(f"你的{label}管理员权限已失效")
         capabilities = await self.gateway.bot_capabilities(channel_id)
         if not capabilities.ready:
-            channel = await self.repository.get_channel(channel_id)
-            label = "超级群组" if channel is not None and channel["chat_type"] == "supergroup" else "频道"
             raise PermissionDenied(f"机器人缺少{label}发送或删除消息权限")

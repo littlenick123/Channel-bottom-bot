@@ -5,7 +5,7 @@ from pathlib import Path
 from bottom_post_bot.channels import ChannelIdentity, ChannelService
 from bottom_post_bot.database import Database
 from bottom_post_bot.domain import ContentItem
-from bottom_post_bot.permissions import BotCapabilities, PermissionDenied, PermissionService
+from bottom_post_bot.permissions import BotCapabilities, PermissionDenied, PermissionService, PermissionUnavailable
 from bottom_post_bot.repositories import Repository
 
 
@@ -14,10 +14,11 @@ class FakePermissionGateway:
         self.user_admin = user_admin
         self.bot_ok = bot_ok
         self.resolve_calls: list[str | int] = []
+        self.channel = ChannelIdentity(-1007, "News", "news")
 
     async def resolve_channel(self, reference):
         self.resolve_calls.append(reference)
-        return ChannelIdentity(-1007, "News", "news")
+        return self.channel
 
     async def user_is_admin(self, channel_id: int, user_id: int) -> bool:
         return self.user_admin
@@ -199,6 +200,26 @@ class PermissionServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.db.fetch_value("SELECT COUNT(*) FROM audit_logs WHERE channel_id=?", (-10050,)),
             0,
         )
+
+    async def test_supergroup_permission_messages_use_the_stored_chat_type(self) -> None:
+        gateway = FakePermissionGateway()
+        gateway.channel = ChannelIdentity(-1007, "Group", "group", "supergroup")
+        permissions = PermissionService(self.repo, gateway)
+        channels = ChannelService(
+            self.repo,
+            permissions,
+            max_channels=10,
+            max_slots=10,
+            storage_channel_id=-10050,
+        )
+        await channels.bind(1, "@group")
+        gateway.user_admin = False
+
+        with self.assertRaisesRegex(PermissionDenied, "超级群组"):
+            await permissions.assert_user_can_manage(1, -1007)
+        with self.assertRaisesRegex(PermissionDenied, "超级群组"):
+            await permissions.assert_user_can_manage(1, -1007)
+        self.assertIn("频道或超级群组", PermissionUnavailable.public_message)
 
 
 if __name__ == "__main__":

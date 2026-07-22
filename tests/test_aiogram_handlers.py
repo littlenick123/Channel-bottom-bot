@@ -292,7 +292,7 @@ class PendingDraftConfirmationHandlerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             message.answers[-1][0],
-            "操作失败：暂时无法确认频道管理员权限，请稍后重试",
+            "操作失败：暂时无法确认频道或超级群组的管理员权限，请稍后重试",
         )
         self.assertNotIn("TelegramForbiddenError", message.answers[-1][0])
 
