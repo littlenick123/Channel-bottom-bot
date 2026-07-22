@@ -109,7 +109,22 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         channel = await self.repo.get_channel(-1001)
         self.assertEqual(channel["status"], "paused")
-        self.assertEqual(len(notifier.calls), 1)
+        self.assertEqual(notifier.calls, [(-1001, "频道/超级群组连续发布失败五次，自动置底已暂停。")])
+
+    async def test_permission_pause_notice_uses_channel_or_supergroup_wording(self) -> None:
+        await self.repo.upsert_channel(-1001, "Group", None, chat_type="supergroup")
+        notifier = FakeNotifier()
+        scheduler = RefreshScheduler(
+            self.repo,
+            FakePublisher([RefreshOutcome.PAUSED]),
+            clock=self.clock.time,
+            notifier=notifier,
+        )
+        await scheduler.request(-1001, "new-message", 0)
+
+        await scheduler.run_due_once()
+
+        self.assertEqual(notifier.calls, [(-1001, "频道/超级群组发布权限或存储配置不可用，自动置底已暂停。")])
 
 
 if __name__ == "__main__":

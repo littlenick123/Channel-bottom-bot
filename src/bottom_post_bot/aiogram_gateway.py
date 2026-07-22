@@ -24,7 +24,7 @@ from aiogram.types import (
     MessageEntity,
 )
 
-from .channels import ChannelIdentity
+from .channels import ChannelIdentity, UnsupportedChatTypeError
 from .domain import ButtonSpec, ContentItem
 from .drafts import IncomingContent
 from .permissions import BotCapabilities, PermissionUnavailable
@@ -54,7 +54,7 @@ class BotApiPermissionGateway:
         chat = await self.bot.get_chat(reference)
         chat_type = str(getattr(chat.type, "value", chat.type)).lower()
         if chat_type not in {"channel", "supergroup"}:
-            raise ValueError("目标不是 Telegram 频道或超级群组")
+            raise UnsupportedChatTypeError("目标不是 Telegram 频道或超级群组")
         return ChannelIdentity(int(chat.id), str(chat.title or chat.id), getattr(chat, "username", None), chat_type)
 
     async def user_is_admin(self, channel_id: int, user_id: int) -> bool:
@@ -177,7 +177,7 @@ class BotApiGateway:
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            raise PermanentPublishError(f"频道发帖失败：{exc}") from exc
+            raise PermanentPublishError(f"频道/超级群组发帖失败：{exc}") from exc
         except TRANSIENT_ERRORS:
             raise
 
@@ -228,7 +228,7 @@ class BotApiGateway:
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
-            raise PermanentPublishError(f"频道相册发布失败：{exc}") from exc
+            raise PermanentPublishError(f"频道/超级群组相册发布失败：{exc}") from exc
 
     @staticmethod
     def _input_media(item: ContentItem):

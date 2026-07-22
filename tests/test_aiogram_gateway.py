@@ -19,6 +19,8 @@ class FakeBot:
         self.album_calls = []
         self.delete_calls = []
         self.copy_error = None
+        self.send_error: Exception | None = None
+        self.album_error: Exception | None = None
         self.user_member_status = "administrator"
         self.user_member_error: Exception | None = None
         self.chat_type = "channel"
@@ -33,6 +35,8 @@ class FakeBot:
 
     async def send_message(self, **kwargs):
         self.message_calls.append(kwargs)
+        if self.send_error is not None:
+            raise self.send_error
         return SimpleNamespace(message_id=901)
 
     async def send_photo(self, **kwargs):
@@ -41,6 +45,8 @@ class FakeBot:
 
     async def send_media_group(self, **kwargs):
         self.album_calls.append(kwargs)
+        if self.album_error is not None:
+            raise self.album_error
         return [SimpleNamespace(message_id=910 + index) for index, _ in enumerate(kwargs["media"])]
 
     async def delete_messages(self, **kwargs):
@@ -157,6 +163,22 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ids, [910, 911])
         self.assertEqual([media.media for media in bot.album_calls[0]["media"]], ["p1", "p2"])
+
+    async def test_publish_failures_use_channel_or_supergroup_wording(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        bot.send_error = TelegramBadRequest(GetMe(), "forbidden")
+        with self.assertRaisesRegex(PermanentPublishError, "频道/超级群组发帖失败"):
+            await gateway.send_content(-1007, ContentItem(text="post"), (), silent=True)
+
+        bot.album_error = TelegramForbiddenError(GetMe(), "forbidden")
+        with self.assertRaisesRegex(PermanentPublishError, "频道/超级群组相册发布失败"):
+            await gateway.send_content_group(
+                -1007,
+                (ContentItem(media_kind="photo", telegram_file_id="file"),),
+                (),
+                silent=True,
+            )
 
     async def test_permission_gateway_uses_get_chat_member(self) -> None:
         gateway = BotApiPermissionGateway(FakeBot())

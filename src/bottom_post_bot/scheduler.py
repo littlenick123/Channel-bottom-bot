@@ -68,12 +68,12 @@ class RefreshScheduler:
                 return
             if outcome is RefreshOutcome.PAUSED:
                 await self.repository.pause_channel(job.channel_id, "publishing requires administrator action")
-                await self._notify_paused(job.channel_id, "频道发布权限或存储配置不可用，自动置底已暂停。")
+                await self._notify_paused(job.channel_id, "频道/超级群组发布权限或存储配置不可用，自动置底已暂停。")
                 return
             attempt = job.attempts + 1
             if attempt >= len(BACKOFF_SECONDS):
                 await self.repository.pause_channel(job.channel_id, "publishing failed five times")
-                await self._notify_paused(job.channel_id, "频道连续发布失败五次，自动置底已暂停。")
+                await self._notify_paused(job.channel_id, "频道/超级群组连续发布失败五次，自动置底已暂停。")
                 return
             await self.repository.retry_refresh(
                 job.channel_id,

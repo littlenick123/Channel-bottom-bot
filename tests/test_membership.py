@@ -14,7 +14,7 @@ from aiogram.methods import GetMe
 from bottom_post_bot.aiogram_gateway import BotApiPermissionGateway
 from bottom_post_bot.app import build_router
 from bottom_post_bot.analytics import AnalyticsService, MemberUpdateAdapter
-from bottom_post_bot.channels import ChannelIdentity, ChannelService
+from bottom_post_bot.channels import ChannelIdentity, ChannelService, UnsupportedChatTypeError
 from bottom_post_bot.database import Database
 from bottom_post_bot.domain import ContentItem
 from bottom_post_bot.membership import ChatMembershipService
@@ -191,7 +191,7 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
             -1008: TelegramForbiddenError(GetMe(), "bot removed"),
             -1009: TelegramBadRequest(GetMe(), "chat deleted"),
             -1010: TelegramNetworkError(GetMe(), "offline"),
-            -1011: ValueError("legacy basic group"),
+            -1011: UnsupportedChatTypeError("legacy basic group"),
         }
         for user_id, channel_id in enumerate((-1007, -1008, -1009, -1010, -1011), start=1):
             await self.repository.upsert_user(user_id, f"Manager {user_id}")
@@ -212,6 +212,19 @@ class ChatMembershipServiceTests(unittest.IsolatedAsyncioTestCase):
             row = await self.repository.get_daily_member_stats(channel_id, "2026-01-02")
             self.assertIsNotNone(row)
             self.assertFalse(row.is_complete)
+
+    async def test_startup_reconciliation_propagates_programming_errors(self) -> None:
+        await self.repository.upsert_user(1, "Manager")
+        await self.repository.upsert_channel(-1007, "Chat", None)
+        await self.repository.bind_manager(1, -1007, max_channels=1)
+
+        async def resolve_channel(channel_id):
+            raise AttributeError("unexpected gateway bug")
+
+        self.gateway.resolve_channel = resolve_channel
+
+        with self.assertRaisesRegex(AttributeError, "unexpected gateway bug"):
+            await self.membership.reconcile_managed_chats(datetime(2026, 1, 2, tzinfo=UTC))
 
     async def test_non_admin_actor_records_channel_and_audits_without_manager_or_pause(self) -> None:
         self.gateway.user_admin = False

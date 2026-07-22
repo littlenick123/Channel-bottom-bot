@@ -3,11 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
+from aiogram.exceptions import TelegramAPIError
+
 from .permissions import PermissionDenied, PermissionService
 from .repositories import Repository
 
 
 logger = logging.getLogger(__name__)
+
+
+class UnsupportedChatTypeError(ValueError):
+    """Telegram resolved a chat type this bot does not manage."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +78,7 @@ class ChannelService:
             channel_id = int(row["id"])
             try:
                 channel = await self.permissions.gateway.resolve_channel(channel_id)
-            except Exception as exc:
+            except (TelegramAPIError, UnsupportedChatTypeError, PermissionDenied) as exc:
                 failed_ids.append(channel_id)
                 logger.warning(
                     "Managed chat reconciliation failed",

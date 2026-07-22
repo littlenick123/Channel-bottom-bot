@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 from bottom_post_bot.domain import ButtonSpec
 from bottom_post_bot.handlers import parse_button_batch, parse_button_input
-from bottom_post_bot.listeners import ChannelListener
+from bottom_post_bot.listeners import ChannelListener, _USER_CONTENT_TYPES
+from aiogram.enums import ContentType
 
 
 class FakeRepository:
@@ -148,6 +149,55 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(scheduler.calls, [])
+
+    async def test_all_supported_non_service_content_types_trigger_supergroup_or_channel_refresh(self) -> None:
+        expected = {
+            ContentType.TEXT,
+            ContentType.ANIMATION,
+            ContentType.AUDIO,
+            ContentType.DOCUMENT,
+            ContentType.LIVE_PHOTO,
+            ContentType.PAID_MEDIA,
+            ContentType.PHOTO,
+            ContentType.STICKER,
+            ContentType.STORY,
+            ContentType.VIDEO,
+            ContentType.VIDEO_NOTE,
+            ContentType.VOICE,
+            ContentType.CHECKLIST,
+            ContentType.CONTACT,
+            ContentType.DICE,
+            ContentType.GAME,
+            ContentType.POLL,
+            ContentType.VENUE,
+            ContentType.LOCATION,
+            ContentType.INVOICE,
+            ContentType.USERS_SHARED,
+            ContentType.CHAT_SHARED,
+            ContentType.GIFT,
+            ContentType.UNIQUE_GIFT,
+            ContentType.GIFT_UPGRADE_SENT,
+            ContentType.GIVEAWAY,
+            ContentType.WEB_APP_DATA,
+            ContentType.USER_SHARED,
+            ContentType.RICH_MESSAGE,
+        }
+        self.assertEqual(_USER_CONTENT_TYPES, expected)
+
+        scheduler = FakeScheduler()
+        listener = ChannelListener(FakeRepository(), scheduler)
+        await listener.handle(
+            SimpleNamespace(chat=SimpleNamespace(id=-1007), message_id=31, content_type=ContentType.GIVEAWAY)
+        )
+        await listener.handle(
+            SimpleNamespace(
+                chat=SimpleNamespace(id=-1007),
+                message_id=32,
+                from_user=SimpleNamespace(is_bot=False),
+                content_type=ContentType.GIFT,
+            )
+        )
+        self.assertEqual(scheduler.calls, [(-1007, "channel-message:31", 10), (-1007, "channel-message:32", 10)])
 
 
 if __name__ == "__main__":
