@@ -25,14 +25,7 @@ _USER_CONTENT_TYPES = frozenset(
         ContentType.VENUE,
         ContentType.LOCATION,
         ContentType.INVOICE,
-        ContentType.USERS_SHARED,
-        ContentType.CHAT_SHARED,
-        ContentType.GIFT,
-        ContentType.UNIQUE_GIFT,
-        ContentType.GIFT_UPGRADE_SENT,
         ContentType.GIVEAWAY,
-        ContentType.WEB_APP_DATA,
-        ContentType.USER_SHARED,
         ContentType.RICH_MESSAGE,
     }
 )

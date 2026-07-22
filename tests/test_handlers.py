@@ -137,6 +137,13 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
             "boost_added",
             "general_forum_topic_hidden",
             "suggested_post_paid",
+            ContentType.USERS_SHARED,
+            ContentType.CHAT_SHARED,
+            ContentType.GIFT,
+            ContentType.UNIQUE_GIFT,
+            ContentType.GIFT_UPGRADE_SENT,
+            ContentType.WEB_APP_DATA,
+            ContentType.USER_SHARED,
         ):
             with self.subTest(content_type=content_type):
                 await listener.handle(
@@ -172,14 +179,7 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
             ContentType.VENUE,
             ContentType.LOCATION,
             ContentType.INVOICE,
-            ContentType.USERS_SHARED,
-            ContentType.CHAT_SHARED,
-            ContentType.GIFT,
-            ContentType.UNIQUE_GIFT,
-            ContentType.GIFT_UPGRADE_SENT,
             ContentType.GIVEAWAY,
-            ContentType.WEB_APP_DATA,
-            ContentType.USER_SHARED,
             ContentType.RICH_MESSAGE,
         }
         self.assertEqual(_USER_CONTENT_TYPES, expected)
@@ -194,7 +194,7 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-1007),
                 message_id=32,
                 from_user=SimpleNamespace(is_bot=False),
-                content_type=ContentType.GIFT,
+                content_type=ContentType.RICH_MESSAGE,
             )
         )
         self.assertEqual(scheduler.calls, [(-1007, "channel-message:31", 10), (-1007, "channel-message:32", 10)])
