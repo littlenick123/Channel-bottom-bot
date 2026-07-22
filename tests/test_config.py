@@ -1,9 +1,11 @@
 import os
 from datetime import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfoNotFoundError
 
-from bottom_post_bot import config
+from bottom_post_bot import app, config
 from bottom_post_bot.config import ConfigurationError, Settings
 
 
@@ -65,6 +67,40 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigurationError, "STATS_TIMEZONE"):
                 Settings.from_env()
 
+    def test_timezone_error_explains_missing_tzdata_dependency(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "STORAGE_CHANNEL_ID": "-1001",
+            "OPERATOR_USER_IDS": "7",
+            "STATS_TIMEZONE": "Asia/Shanghai",
+        }
+        missing = ZoneInfoNotFoundError("No time zone found with key Asia/Shanghai")
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(config, "ZoneInfo", side_effect=missing),
+            patch.object(config, "find_spec", return_value=None),
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "tzdata"):
+                Settings.from_env()
+
+    def test_invalid_timezone_does_not_blame_tzdata_when_package_is_installed(self) -> None:
+        env = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "STORAGE_CHANNEL_ID": "-1001",
+            "OPERATOR_USER_IDS": "7",
+            "STATS_TIMEZONE": "Mars/Olympus",
+        }
+        unknown = ZoneInfoNotFoundError("No time zone found with key Mars/Olympus")
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(config, "ZoneInfo", side_effect=unknown),
+            patch("bottom_post_bot.config.find_spec", create=True, return_value=object()),
+        ):
+            with self.assertRaises(ConfigurationError) as raised:
+                Settings.from_env()
+
+        self.assertNotIn("install project dependencies", str(raised.exception))
+
     def test_rejects_missing_required_value(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "TELEGRAM_BOT_TOKEN"):
@@ -91,3 +127,26 @@ class SettingsTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             with self.assertRaisesRegex(ConfigurationError, "PENDING_DRAFT_TTL_SECONDS"):
                 Settings.from_env()
+
+
+class StartupEnvironmentTests(unittest.TestCase):
+    def test_main_loads_dotenv_before_reading_settings(self) -> None:
+        order: list[str] = []
+
+        def load_settings():
+            self.assertEqual(order, ["dotenv"])
+            order.append("settings")
+            return SimpleNamespace(log_level="INFO")
+
+        def run_coroutine(coroutine):
+            coroutine.close()
+
+        with (
+            patch("bottom_post_bot.app.load_dotenv", create=True, side_effect=lambda: order.append("dotenv")),
+            patch.object(app.Settings, "from_env", side_effect=load_settings),
+            patch.object(app, "configure_logging"),
+            patch.object(app.asyncio, "run", side_effect=run_coroutine),
+        ):
+            app.main()
+
+        self.assertEqual(order, ["dotenv", "settings"])

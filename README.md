@@ -46,28 +46,21 @@ python -m pip install -e '.[test]'
 cp .env.example .env
 ```
 
-编辑 `.env` 后，把变量载入当前进程并启动：
+编辑 `.env` 后直接启动：
 
 ```powershell
-Get-Content .env | ForEach-Object {
-    if ($_ -match '^[^#].*=') {
-        $name, $value = $_ -split '=', 2
-        Set-Item -Path "Env:$name" -Value $value
-    }
-}
 python -m bottom_post_bot
 ```
 
-Linux 可使用：
+Linux 同样直接运行：
 
 ```bash
-set -a
-. ./.env
-set +a
 python -m bottom_post_bot
 ```
 
-项目故意不自动读取 `.env`，避免部署时意外覆盖由容器、systemd 或密钥管理器注入的值。
+启动入口会通过 `python-dotenv` 自动读取项目目录中的 `.env`。系统、Docker、systemd 或密钥管理器已经注入的环境变量优先，不会被 `.env` 覆盖。
+
+拉取包含新依赖的版本后，请在现有虚拟环境中重新执行 `python -m pip install -e ".[test]"`。Windows 本身通常不提供 IANA 时区数据库，成员统计依赖项目声明的 `tzdata` 包识别 `Asia/Shanghai`。
 
 ### 从旧 Telethon 版本升级
 

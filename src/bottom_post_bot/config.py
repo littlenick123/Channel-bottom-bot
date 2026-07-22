@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from datetime import time
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,7 +37,14 @@ def _timezone(name: str, default: str) -> str:
     value = os.getenv(name, default).strip()
     try:
         ZoneInfo(value)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except ZoneInfoNotFoundError as exc:
+        if find_spec("tzdata") is None:
+            raise ConfigurationError(
+                f"{name} cannot be loaded because timezone data is unavailable; "
+                "install project dependencies so the tzdata package is available"
+            ) from exc
+        raise ConfigurationError(f"{name} must be a known IANA timezone") from exc
+    except ValueError as exc:
         raise ConfigurationError(f"{name} must be a known IANA timezone") from exc
     return value
 

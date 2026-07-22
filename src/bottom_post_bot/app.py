@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
 from aiogram.types import BotCommand
+from dotenv import load_dotenv
 
 from .aiogram_gateway import BotApiGateway, BotApiPermissionGateway
 from .analytics import AnalyticsService, MemberUpdateAdapter
@@ -188,6 +189,7 @@ async def run(settings: Settings) -> None:
 
 
 def main() -> None:
+    load_dotenv()
     try:
         settings = Settings.from_env()
     except ConfigurationError as exc:
