@@ -157,7 +157,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             "processed_member_updates": {"update_id", "channel_id", "direction", "event_at", "processed_at"},
             "chat_analytics_state": {"channel_id", "started_at", "last_member_count", "last_count_at"},
             "analytics_runtime_state": {"id", "last_heartbeat_at"},
-            "daily_report_deliveries": {"user_id", "report_date", "status", "attempts", "next_attempt_at", "last_error", "sent_at"},
+            "daily_report_deliveries": {"user_id", "report_date", "status", "attempts", "next_attempt_at", "last_error", "sent_at", "payload_json", "next_chunk_index"},
         }.items():
             with self.subTest(table=table):
                 columns = {row["name"] for row in await self.db.fetch_all(f"PRAGMA table_info({table})")}

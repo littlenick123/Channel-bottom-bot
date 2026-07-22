@@ -162,6 +162,8 @@ class DailyReportDelivery:
     next_attempt_at: float | None
     last_error: str | None = None
     sent_at: float | None = None
+    payload_json: str | None = None
+    next_chunk_index: int = 0
 
 
 def enabled_slots_in_publish_order(slots: Iterable[SlotSnapshot]) -> list[SlotSnapshot]:

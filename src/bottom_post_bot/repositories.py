@@ -1036,7 +1036,7 @@ class Repository:
 
     async def list_due_daily_report_deliveries(self, now: float, limit: int = 100) -> list[DailyReportDelivery]:
         rows = await self.db.fetch_all(
-            """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at
+            """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at, payload_json, next_chunk_index
                FROM daily_report_deliveries
                WHERE status IN ('pending', 'retry') AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?
                ORDER BY next_attempt_at, user_id, report_date LIMIT ?""",
@@ -1058,12 +1058,31 @@ class Repository:
                 return None
             row = await (
                 await connection.execute(
-                    """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at
+                    """SELECT user_id, report_date, status, attempts, next_attempt_at, last_error, sent_at, payload_json, next_chunk_index
                        FROM daily_report_deliveries WHERE user_id=? AND report_date=?""",
                     (user_id, report_date),
                 )
             ).fetchone()
             return self._daily_report_delivery(row)
+
+    async def store_daily_report_payload(self, user_id: int, report_date: str, payload_json: str) -> bool:
+        """Persist the immutable chunks before the first private-message attempt."""
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries SET payload_json=?, next_chunk_index=0
+                   WHERE user_id=? AND report_date=? AND status='sending' AND payload_json IS NULL""",
+                (payload_json, user_id, report_date),
+            )
+            return cursor.rowcount > 0
+
+    async def advance_daily_report_delivery_chunk(self, user_id: int, report_date: str, next_chunk_index: int) -> bool:
+        async with self.db.transaction() as connection:
+            cursor = await connection.execute(
+                """UPDATE daily_report_deliveries SET next_chunk_index=?
+                   WHERE user_id=? AND report_date=? AND status='sending' AND next_chunk_index < ?""",
+                (next_chunk_index, user_id, report_date, next_chunk_index),
+            )
+            return cursor.rowcount > 0
 
     async def record_daily_report_delivery_failure(
         self, user_id: int, report_date: str, error: str, next_attempt_at: float
@@ -1119,6 +1138,8 @@ class Repository:
             None if row["next_attempt_at"] is None else float(row["next_attempt_at"]),
             row["last_error"],
             None if row["sent_at"] is None else float(row["sent_at"]),
+            row["payload_json"],
+            int(row["next_chunk_index"]),
         )
 
     async def health_counts(self) -> dict[str, int]:

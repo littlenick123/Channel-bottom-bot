@@ -140,11 +140,17 @@ class AnalyticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_stats_subscriptions_are_independent_and_respect_report_cutoff(self) -> None:
         await self.repo.upsert_user(8, "Bob")
         await self.repo.bind_manager(8, -1001, 10)
+        await self.db.execute("UPDATE channel_managers SET bound_at='2026-01-01 00:00:00' WHERE channel_id=-1001")
+        await self.repo.upsert_channel(-1002, "Late", "late")
+        await self.repo.bind_manager(8, -1002, 10)
+        await self.db.execute(
+            "UPDATE channel_managers SET bound_at='2026-01-02 00:06:00' WHERE user_id=8 AND channel_id=-1002"
+        )
         await self.repo.set_manager_stats_push_enabled(7, -1001, False)
 
-        self.assertEqual(await self.repo.list_daily_report_manager_ids("2999-01-01 00:05:00"), [8])
-        self.assertEqual(await self.repo.list_user_stats_subscription_ids(8, "2999-01-01 00:05:00"), [-1001])
-        self.assertEqual(await self.repo.list_user_stats_subscription_ids(7, "2999-01-01 00:05:00"), [])
+        self.assertEqual(await self.repo.list_daily_report_manager_ids("2026-01-02 00:05:00"), [8])
+        self.assertEqual(await self.repo.list_user_stats_subscription_ids(8, "2026-01-02 00:05:00"), [-1001])
+        self.assertEqual(await self.repo.list_user_stats_subscription_ids(7, "2026-01-02 00:05:00"), [])
 
     async def test_legacy_channel_upsert_preserves_stored_type_but_explicit_type_updates_it(self) -> None:
         await self.repo.upsert_channel(-1001, "News", "news", chat_type="supergroup")

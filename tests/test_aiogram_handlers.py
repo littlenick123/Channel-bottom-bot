@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from bottom_post_bot.domain import ContentItem, DailyMemberStats, Draft, DraftRevision, MemberStatsReport, PendingDraft, SlotSnapshot
 from bottom_post_bot.handlers import BotHandlers, message_to_incoming
-from bottom_post_bot.permissions import PermissionUnavailable
+from bottom_post_bot.permissions import PermissionDenied, PermissionUnavailable
 from bottom_post_bot.repositories import AuthorizationError, ResourceLimitError
 
 
@@ -505,6 +505,14 @@ class StatsHandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.handlers._dispatch_callback(SimpleNamespace(), 42, f"s:t:{channel_id}:0")
         self.permissions.assert_user_can_manage.assert_awaited_with(42, channel_id)
         self.repository.set_manager_stats_push_enabled.assert_awaited_once_with(42, channel_id, False)
+
+    async def test_stats_command_reports_stale_binding_inside_normal_error_boundary(self) -> None:
+        self.permissions.assert_user_can_manage.side_effect = PermissionDenied("你的频道管理员权限已失效")
+        message = forwarded_message(text="/stats")
+
+        await self.handlers.on_private_message(message)
+
+        self.assertEqual(message.answers[-1][0], "操作失败：你的频道管理员权限已失效")
 
 
 class AiogramMessageConversionTests(unittest.TestCase):

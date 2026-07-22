@@ -185,15 +185,16 @@ class BotHandlers:
         if command == "/status":
             await self.show_status(message, user_id)
             return
-        if command == "/stats":
-            await self.show_stats(message, user_id)
-            return
         if command == "/health":
             await self.show_health(message, user_id)
             return
 
-        state = await self.repository.get_conversation(user_id)
+        state = None
         try:
+            if command == "/stats":
+                await self.show_stats(message, user_id)
+                return
+            state = await self.repository.get_conversation(user_id)
             if state:
                 await self._handle_state(message, user_id, state[0], state[1])
             elif self._is_forwarded(message):

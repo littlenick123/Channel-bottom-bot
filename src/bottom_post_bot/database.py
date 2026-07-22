@@ -244,6 +244,8 @@ MIGRATION_6 = (
         next_attempt_at REAL,
         last_error TEXT,
         sent_at REAL,
+        payload_json TEXT,
+        next_chunk_index INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (user_id, report_date)
     )
     """,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -9,7 +10,7 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from .analytics import AnalyticsService
-from .permissions import PermissionDenied
+from .permissions import PermissionDenied, PermissionUnavailable
 from .publisher import FloodWaitSignal, RefreshOutcome
 from .repositories import Repository
 from .stats import format_chat_report, split_chat_reports
@@ -176,30 +177,65 @@ class DailyStatsScheduler:
         claimed = await self.repository.claim_daily_report_delivery(delivery.user_id, delivery.report_date, now.timestamp())
         if claimed is None:
             return
-        cutoff = datetime.combine(datetime.fromisoformat(claimed.report_date).date(), self.push_time, tzinfo=self.timezone)
-        chat_ids = await self.repository.list_user_stats_subscription_ids(claimed.user_id, self._utc_db_timestamp(cutoff))
-        reports = []
-        for chat_id in chat_ids:
-            try:
-                await self.permissions.assert_user_can_manage(claimed.user_id, chat_id)
-                reports.append(format_chat_report(await self.analytics.get_chat_report(claimed.user_id, chat_id, now), timezone=self.timezone))
-            except PermissionDenied:
-                continue
-        if not reports:
-            await self.repository.mark_daily_report_delivery_sent(claimed.user_id, claimed.report_date, now.timestamp())
+        payload = await self._payload_for_delivery(claimed, now)
+        if payload is None:
             return
         try:
-            for text in split_chat_reports(reports, header=f"📈 每日成员统计（{claimed.report_date}）"):
+            for index, text in enumerate(payload["chunks"][claimed.next_chunk_index :], start=claimed.next_chunk_index):
                 await self.delivery_gateway.send_private_text(claimed.user_id, text)
+                await self.repository.advance_daily_report_delivery_chunk(claimed.user_id, claimed.report_date, index + 1)
         except PrivateDeliveryError as exc:
             await self.repository.mark_daily_report_delivery_terminal(claimed.user_id, claimed.report_date, str(exc))
         except Exception as exc:
-            delay = DAILY_REPORT_RETRY_SECONDS[min(claimed.attempts - 1, len(DAILY_REPORT_RETRY_SECONDS) - 1)]
-            await self.repository.record_daily_report_delivery_failure(
-                claimed.user_id, claimed.report_date, str(exc), now.timestamp() + delay
-            )
+            await self._retry(claimed, now, exc)
         else:
             await self.repository.mark_daily_report_delivery_sent(claimed.user_id, claimed.report_date, now.timestamp())
+
+    async def _retry(self, delivery, now: datetime, error: Exception) -> None:
+        delay = DAILY_REPORT_RETRY_SECONDS[min(delivery.attempts - 1, len(DAILY_REPORT_RETRY_SECONDS) - 1)]
+        await self.repository.record_daily_report_delivery_failure(
+            delivery.user_id, delivery.report_date, str(error), now.timestamp() + delay
+        )
+
+    async def _payload_for_delivery(self, delivery, now: datetime) -> dict | None:
+        if delivery.payload_json is not None:
+            payload = json.loads(delivery.payload_json)
+            for chat_id in payload["chat_ids"]:
+                try:
+                    await self.permissions.assert_user_can_manage(delivery.user_id, int(chat_id))
+                except PermissionUnavailable as exc:
+                    await self._retry(delivery, now, exc)
+                    return None
+                except PermissionDenied:
+                    await self.repository.mark_daily_report_delivery_sent(delivery.user_id, delivery.report_date, now.timestamp())
+                    return None
+            return payload
+        cutoff = datetime.combine(datetime.fromisoformat(delivery.report_date).date(), self.push_time, tzinfo=self.timezone)
+        chat_ids = await self.repository.list_user_stats_subscription_ids(delivery.user_id, self._utc_db_timestamp(cutoff))
+        reports = []
+        report_chat_ids = []
+        for chat_id in chat_ids:
+            try:
+                await self.permissions.assert_user_can_manage(delivery.user_id, chat_id)
+                reports.append(format_chat_report(await self.analytics.get_chat_report(delivery.user_id, chat_id, now), timezone=self.timezone))
+                report_chat_ids.append(chat_id)
+            except PermissionUnavailable as exc:
+                await self._retry(delivery, now, exc)
+                return None
+            except PermissionDenied:
+                continue
+        if not reports:
+            await self.repository.mark_daily_report_delivery_sent(delivery.user_id, delivery.report_date, now.timestamp())
+            return None
+        payload = {
+            "chat_ids": report_chat_ids,
+            "chunks": split_chat_reports(reports, header=f"📈 每日成员统计（{delivery.report_date}）"),
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if not await self.repository.store_daily_report_payload(delivery.user_id, delivery.report_date, serialized):
+            await self._retry(delivery, now, RuntimeError("could not persist daily report payload"))
+            return None
+        return payload
 
     async def run_forever(self) -> None:
         self._stopping = False
@@ -214,6 +250,8 @@ class DailyStatsScheduler:
         await self.repository.recover_stuck_daily_report_deliveries(self.clock())
         while not self._stopping:
             await self.run_due_once()
+            if self._stopping:
+                break
             self._wake.clear()
             try:
                 await asyncio.wait_for(self._wake.wait(), timeout=60)
