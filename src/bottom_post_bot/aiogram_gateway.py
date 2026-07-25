@@ -40,6 +40,14 @@ def _message_id(value) -> int:
     return int(getattr(value, "message_id", getattr(value, "id", 0)))
 
 
+def _message_is_already_absent(exc: TelegramBadRequest) -> bool:
+    message = str(exc).lower()
+    return any(
+        fragment in message
+        for fragment in ("not found", "can't be deleted", "invalid message identifier")
+    )
+
+
 def _entities(value: str) -> list[MessageEntity]:
     if not value:
         return []
@@ -152,7 +160,10 @@ class BotApiGateway:
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except TelegramBadRequest as exc:
-            if "not found" in str(exc).lower() or "can't be deleted" in str(exc).lower():
+            if _message_is_already_absent(exc):
+                if len(message_ids) > 1:
+                    for message_id in message_ids:
+                        await self.delete_messages(channel_id, [message_id])
                 return
             raise PermanentPublishError(f"无法删除旧置底帖：{exc}") from exc
         except TelegramForbiddenError as exc:

@@ -22,6 +22,7 @@ class FakeBot:
         self.copy_error = None
         self.send_error: Exception | None = None
         self.album_error: Exception | None = None
+        self.delete_errors: dict[tuple[int, ...], Exception] = {}
         self.user_member_status = "administrator"
         self.user_member_error: Exception | None = None
         self.chat_type = "channel"
@@ -52,6 +53,9 @@ class FakeBot:
 
     async def delete_messages(self, **kwargs):
         self.delete_calls.append(kwargs)
+        error = self.delete_errors.get(tuple(kwargs["message_ids"]))
+        if error is not None:
+            raise error
         return True
 
     async def get_chat(self, reference):
@@ -78,6 +82,19 @@ class FakeBot:
 
 
 class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_messages_retries_individually_when_bulk_contains_missing_message(self) -> None:
+        bot = FakeBot()
+        invalid = TelegramBadRequest(GetMe(), "invalid message identifier specified")
+        bot.delete_errors[(701, 702, 703)] = invalid
+        bot.delete_errors[(702,)] = invalid
+
+        await BotApiGateway(bot, storage_channel_id=-10050).delete_messages(-1007, [701, 702, 703])
+
+        self.assertEqual(
+            [call["message_ids"] for call in bot.delete_calls],
+            [[701, 702, 703], [701], [702], [703]],
+        )
+
     async def test_private_report_text_maps_blocked_delivery_to_terminal_error(self) -> None:
         bot = FakeBot()
         gateway = BotApiGateway(bot, storage_channel_id=-10050)
