@@ -271,12 +271,25 @@ class BotApiGateway:
     def _build_buttons(buttons: Sequence[ButtonSpec]) -> InlineKeyboardMarkup | None:
         if not buttons:
             return None
+        telegram_styles = {
+            "default": None,
+            "blue": "primary",
+            "green": "success",
+            "red": "danger",
+        }
         rows: defaultdict[int, list[ButtonSpec]] = defaultdict(list)
         for button in buttons:
             rows[button.row].append(button)
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=button.text, url=button.url) for button in sorted(rows[row], key=lambda value: value.column)]
+                [
+                    InlineKeyboardButton(
+                        text=button.text,
+                        url=button.url,
+                        style=telegram_styles[button.style],
+                    )
+                    for button in sorted(rows[row], key=lambda value: value.column)
+                ]
                 for row in sorted(rows)
             ]
         )

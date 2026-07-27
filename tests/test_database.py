@@ -31,7 +31,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         version = await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations")
         self.assertEqual(foreign_keys, 1)
         self.assertEqual(str(journal_mode).lower(), "wal")
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
 
     async def test_migration_four_backfills_slot_names_from_existing_drafts(self) -> None:
         await self.db.close()
@@ -40,7 +40,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
         slot = await self.db.fetch_one(
             "SELECT display_name, name_customized FROM channel_slots WHERE channel_id=? AND slot_number=?",
             (-1009, 1),
@@ -111,9 +111,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.db = await Database.open(database_path)
         self.repo = Repository(self.db)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
-        active_buttons = await self.db.fetch_all("SELECT id, url FROM draft_buttons ORDER BY id")
-        self.assertEqual([(row["id"], row["url"]) for row in active_buttons], [(valid_id, "HTTPS://example.com/path")])
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        active_buttons = await self.db.fetch_all("SELECT id, url, style FROM draft_buttons ORDER BY id")
+        self.assertEqual(
+            [(row["id"], row["url"], row["style"]) for row in active_buttons],
+            [(valid_id, "HTTPS://example.com/path", "default")],
+        )
         quarantined = await self.db.fetch_all(
             """SELECT original_button_id, revision_id, row_number, column_number, text, url, reason, quarantined_at
                FROM quarantined_draft_buttons ORDER BY original_button_id"""
@@ -129,6 +132,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([button.url for button in draft.current_revision.buttons], ["HTTPS://example.com/path"])
         self.assertEqual([button.url for button in slots[0].revision.buttons], ["HTTPS://example.com/path"])
         self.assertEqual([button.url for button in publish_slots[0].revision.buttons], ["HTTPS://example.com/path"])
+        self.assertEqual([button.style for button in draft.current_revision.buttons], ["default"])
 
     async def test_migration_six_adds_analytics_schema_from_version_five(self) -> None:
         await self.db.close()
@@ -145,7 +149,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
         columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channels)")}
         self.assertIn("chat_type", columns)
         manager_columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channel_managers)")}
@@ -167,6 +171,48 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         indexes = {row["name"] for row in await self.db.fetch_all("SELECT name FROM sqlite_master WHERE type='index'")}
         self.assertIn("idx_processed_member_updates_event_at", indexes)
         self.assertIn("idx_daily_report_deliveries_due", indexes)
+
+    async def test_migration_eight_backfills_default_button_style_from_version_seven(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v7.sqlite3"
+        self._create_version_seven_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            revision_id = connection.execute("SELECT id FROM draft_revisions").fetchone()[0]
+            connection.execute(
+                """INSERT INTO draft_buttons(revision_id, row_number, column_number, text, url)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (revision_id, 0, 0, "Legacy", "https://example.com"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.db = await Database.open(database_path)
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertEqual(await self.db.fetch_value("SELECT style FROM draft_buttons"), "default")
+
+    async def test_migration_eight_rolls_back_column_when_later_statement_fails(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v7-rollback.sqlite3"
+        self._create_version_seven_database(database_path)
+        connection = await aiosqlite.connect(database_path)
+        connection.row_factory = aiosqlite.Row
+        self.db = Database(connection)
+        await self.db._configure()
+
+        original_migration = database.MIGRATION_8
+        database.MIGRATION_8 = (*original_migration, "THIS IS NOT VALID SQL")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                await self.db._migrate()
+        finally:
+            database.MIGRATION_8 = original_migration
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
+        columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(draft_buttons)")}
+        self.assertNotIn("style", columns)
 
     async def test_migration_six_rolls_back_every_statement_when_one_fails(self) -> None:
         await self.db.close()
@@ -245,10 +291,12 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             owner_user_id=1,
             name="广告",
             items=(ContentItem(text="hello"),),
-            buttons=(ButtonSpec("网站", "https://example.com", 0, 0),),
+            buttons=(ButtonSpec("网站", "https://example.com", 0, 0, "green"),),
             max_drafts=50,
         )
-        self.assertIsNotNone(await self.repo.get_draft(1, draft.id))
+        loaded = await self.repo.get_draft(1, draft.id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.current_revision.buttons[0].style, "green")
         self.assertIsNone(await self.repo.get_draft(2, draft.id))
 
     async def test_draft_quota_is_enforced(self) -> None:
@@ -326,13 +374,25 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.repo.upsert_user(1, "Alice")
         await self.repo.upsert_channel(-1009, "Channel", None)
         await self.repo.bind_manager(1, -1009, max_channels=10)
-        draft = await self.repo.create_draft(1, "ad", (ContentItem(text="old"),), (), max_drafts=50)
+        draft = await self.repo.create_draft(
+            1,
+            "ad",
+            (ContentItem(text="old"),),
+            (ButtonSpec("旧按钮", "https://example.com/old", 0, 0, "red"),),
+            max_drafts=50,
+        )
         await self.repo.assign_slot(-1009, 1, draft.current_revision.id, actor_id=1, max_slots=10)
-        await self.repo.create_revision(draft.id, 1, (ContentItem(text="new"),), ())
+        await self.repo.create_revision(
+            draft.id,
+            1,
+            (ContentItem(text="new"),),
+            (ButtonSpec("新按钮", "https://example.com/new", 0, 0, "green"),),
+        )
 
         slots, _, _ = await self.repo.load_publish_state(-1009)
 
         self.assertEqual(slots[0].revision.items[0].text, "old")
+        self.assertEqual(slots[0].revision.buttons[0].style, "red")
 
     async def test_owned_draft_name_for_revision_requires_the_active_owner_draft(self) -> None:
         await self.repo.upsert_user(1, "Alice")
@@ -500,6 +560,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             for statement in database.MIGRATION_4:
                 connection.execute(statement)
             connection.execute("INSERT INTO schema_migrations(version) VALUES (4)")
+            connection.commit()
+        finally:
+            connection.close()
+
+    @classmethod
+    def _create_version_seven_database(cls, database_path: Path) -> None:
+        cls._create_version_four_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            for statement in database.MIGRATION_5:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (5)")
+            for statement in database.MIGRATION_6:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (6)")
+            for statement in database.MIGRATION_7:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (7)")
             connection.commit()
         finally:
             connection.close()

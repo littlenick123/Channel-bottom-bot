@@ -402,7 +402,34 @@ class BatchButtonHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.drafts.update_buttons.assert_awaited_once()
         buttons = self.drafts.update_buttons.await_args.args[2]
         self.assertEqual([(button.text, button.row, button.column) for button in buttons], [("官网", 0, 0), ("客服", 0, 1)])
+        self.assertEqual([button.style for button in buttons], ["default", "default"])
         self.assertEqual(message.answers[-1][0], "已添加 2 个按钮。")
+
+    async def test_colored_batch_normalizes_styles_and_preserves_rows(self) -> None:
+        message = forwarded_message(
+            text=(
+                "加入频道 | https://t.me/example | 1 | BLUE\n"
+                "官方网站 | https://example.com | 1 | green\n"
+                "重要提醒 | https://example.com/notice | 2 | red\n"
+                "普通按钮 | https://example.com | 2 | default"
+            )
+        )
+
+        await self.handlers._handle_state(message, 42, "await_button", {"draft_id": 11})
+
+        buttons = self.drafts.update_buttons.await_args.args[2]
+        self.assertEqual(
+            [(button.row, button.column, button.style) for button in buttons],
+            [(0, 0, "blue"), (0, 1, "green"), (1, 0, "red"), (1, 1, "default")],
+        )
+
+    async def test_invalid_color_rejects_complete_batch(self) -> None:
+        message = forwarded_message(text="官网 | https://example.com | 1 | purple")
+
+        with self.assertRaisesRegex(ValueError, "第 1 行：颜色仅支持"):
+            await self.handlers._handle_state(message, 42, "await_button", {"draft_id": 11})
+
+        self.drafts.update_buttons.assert_not_awaited()
 
 
 class ChannelSlotNameHandlerTests(unittest.IsolatedAsyncioTestCase):

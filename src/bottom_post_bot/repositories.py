@@ -357,9 +357,9 @@ class Repository:
             ],
         )
         await connection.executemany(
-            """INSERT INTO draft_buttons(revision_id, row_number, column_number, text, url)
-               VALUES (?, ?, ?, ?, ?)""",
-            [(revision_id, item.row, item.column, item.text, item.url) for item in revision_value.buttons],
+            """INSERT INTO draft_buttons(revision_id, row_number, column_number, text, url, style)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [(revision_id, item.row, item.column, item.text, item.url, item.style) for item in revision_value.buttons],
         )
         return DraftRevision(revision_id, number, revision_value.items, revision_value.buttons)
 
@@ -446,7 +446,13 @@ class Repository:
             for item in item_rows
         )
         buttons = tuple(
-            ButtonSpec(item["text"], item["url"], int(item["row_number"]), int(item["column_number"]))
+            ButtonSpec(
+                item["text"],
+                item["url"],
+                int(item["row_number"]),
+                int(item["column_number"]),
+                str(item["style"]),
+            )
             for item in button_rows
         )
         return DraftRevision(int(row["id"]), int(row["revision_number"]), items, buttons)

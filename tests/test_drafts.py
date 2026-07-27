@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from bottom_post_bot.database import Database
-from bottom_post_bot.domain import ContentItem
+from bottom_post_bot.domain import ButtonSpec, ContentItem
 from bottom_post_bot.drafts import DraftService, IncomingContent, default_draft_name
 from bottom_post_bot.repositories import Repository
 
@@ -62,9 +62,17 @@ class DraftServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_copy_draft_creates_independent_personal_draft(self) -> None:
         draft = await self.service.capture(1, [IncomingContent(10, 1, "hello", None, None, "[]")])
+        await self.service.update_buttons(
+            draft.id,
+            1,
+            (ButtonSpec("网站", "https://example.com", 0, 0, "blue"),),
+        )
         copied = await self.service.copy(draft.id, 1, "copy")
+        source = await self.repo.get_draft(1, draft.id)
         self.assertNotEqual(copied.id, draft.id)
-        self.assertEqual(copied.current_revision.items, draft.current_revision.items)
+        self.assertEqual(copied.current_revision.items, source.current_revision.items)
+        self.assertEqual(copied.current_revision.buttons, source.current_revision.buttons)
+        self.assertEqual(copied.current_revision.buttons[0].style, "blue")
 
 
 if __name__ == "__main__":

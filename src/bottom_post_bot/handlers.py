@@ -65,8 +65,8 @@ def parse_button_batch(value: str, existing: Sequence[ButtonSpec] = ()) -> tuple
             continue
         saw_button = True
         parts = [part.strip() for part in line.split("|")]
-        if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2]:
-            raise ValueError(f"第 {line_number} 行：请使用：按钮文字 | URL | 行号")
+        if len(parts) not in (3, 4) or not all(parts):
+            raise ValueError(f"第 {line_number} 行：请使用：按钮文字 | URL | 行号 | 颜色（颜色可省略）")
         try:
             row = int(parts[2])
         except ValueError as exc:
@@ -79,8 +79,16 @@ def parse_button_batch(value: str, existing: Sequence[ButtonSpec] = ()) -> tuple
         if row_counts.get(row_index, 0) >= 8:
             raise ValueError(f"第 {line_number} 行：一行最多包含 8 个按钮")
         try:
-            button = ButtonSpec(parts[0], parts[1], row_index, next_columns.get(row_index, 0))
+            button = ButtonSpec(
+                parts[0],
+                parts[1],
+                row_index,
+                next_columns.get(row_index, 0),
+                parts[3] if len(parts) == 4 else "default",
+            )
         except ValueError as exc:
+            if "button style" in str(exc):
+                raise ValueError(f"第 {line_number} 行：颜色仅支持 default、blue、green、red") from exc
             raise ValueError(f"第 {line_number} 行：{exc}") from exc
         buttons.append(button)
         row_counts[row_index] = row_counts.get(row_index, 0) + 1
@@ -94,7 +102,7 @@ def parse_button_batch(value: str, existing: Sequence[ButtonSpec] = ()) -> tuple
 def parse_button_input(value: str) -> ButtonSpec:
     buttons = parse_button_batch(value)
     if len(buttons) != 1:
-        raise ValueError("请使用：按钮文字 | URL | 行号")
+        raise ValueError("请使用：按钮文字 | URL | 行号 | 颜色（颜色可省略）")
     return buttons[0]
 
 
@@ -311,10 +319,12 @@ class BotHandlers:
             await self._set_state(user_id, "await_button", {"draft_id": draft_id})
             await self._show(
                 event,
-                "每行一个按钮：按钮文字 | URL | 行号\n"
-                "官网 | https://example.com | 1\n"
-                "客服 | tg://resolve?domain=example | 1\n"
-                "下载 | https://example.com/d | 2",
+                "每行一个按钮：按钮文字 | URL | 行号 | 颜色\n"
+                "加入频道 | https://t.me/example | 1 | blue\n"
+                "官方网站 | https://example.com | 1 | green\n"
+                "重要提醒 | https://example.com/notice | 2 | red\n"
+                "普通按钮 | https://example.com | 2 | default\n\n"
+                "颜色可省略，省略时使用 default。",
             )
         elif data.startswith("d:buttons_clear:"):
             draft_id = int(data.rsplit(":", 1)[1])

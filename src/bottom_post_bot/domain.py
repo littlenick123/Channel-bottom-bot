@@ -11,6 +11,16 @@ class ValidationError(ValueError):
     """Raised when user-provided domain data is invalid."""
 
 
+BUTTON_STYLES = frozenset({"default", "blue", "green", "red"})
+
+
+def normalize_button_style(style: str) -> str:
+    normalized_style = style.strip().lower()
+    if normalized_style not in BUTTON_STYLES:
+        raise ValidationError("button style must be one of: default, blue, green, red")
+    return normalized_style
+
+
 def normalize_button_url(url: str) -> str:
     normalized_url = url.strip()
     lowered_url = normalized_url.lower()
@@ -50,6 +60,7 @@ class ButtonSpec:
     url: str
     row: int
     column: int
+    style: str = "default"
 
     def __post_init__(self) -> None:
         if not self.text.strip():
@@ -57,6 +68,7 @@ class ButtonSpec:
         if self.row < 0 or self.column < 0:
             raise ValidationError("button position cannot be negative")
         object.__setattr__(self, "url", normalize_button_url(self.url))
+        object.__setattr__(self, "style", normalize_button_style(self.style))
 
 
 @dataclass(frozen=True, slots=True)

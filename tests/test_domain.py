@@ -12,6 +12,11 @@ from bottom_post_bot.domain import (
 
 
 class ButtonSpecTests(unittest.TestCase):
+    def test_normalizes_and_validates_button_styles(self) -> None:
+        self.assertEqual(ButtonSpec("打开", "https://example.com", 0, 0, " GrEeN ").style, "green")
+        with self.assertRaisesRegex(ValidationError, "default, blue, green, red"):
+            ButtonSpec("打开", "https://example.com", 0, 0, "purple")
+
     def test_accepts_supported_url_schemes(self) -> None:
         for url in ("https://example.com", "http://example.com", "tg://resolve?domain=x"):
             self.assertEqual(ButtonSpec("打开", url, row=0, column=0).url, url)

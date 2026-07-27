@@ -77,12 +77,132 @@ docker compose logs -f bottom-post-bot
 
 数据库位于 `./data`。Compose 已配置最多五个、每个 10 MB 的日志文件。
 
-升级到含成员统计的版本后，数据库迁移会在容器启动时自动执行。拉取新代码并修改 `.env` 后执行一次：
+### GitHub 更新后在 VPS 升级
+
+以下命令假设项目部署在 `/opt/Channel-bottom-bot`，使用 `main` 分支，并且当前用户拥有 Docker 权限。数据库迁移会在新容器启动时自动执行；整个过程中不要删除或覆盖 `.env` 和 `data`。
+
+#### 1. 检查当前部署
+
+进入项目目录，确认远程仓库、当前分支、运行状态和本地修改：
 
 ```bash
-docker compose up -d --build
+cd /opt/Channel-bottom-bot
+git remote -v
+git branch --show-current
+git status --short --branch
+docker compose ps
+```
+
+正常情况下远程仓库应为：
+
+```text
+https://github.com/littlenick123/Channel-bottom-bot.git
+```
+
+如果 `git status --short` 显示 README、Python 文件或 `docker-compose.yml` 等受 Git 管理的文件被修改，请先确认这些 VPS 本地修改是否需要保留，不要直接执行 `git reset --hard`。`.env` 和 `data` 不应由 Git 管理，不会被正常拉取覆盖。
+
+#### 2. 获取并检查 GitHub 更新
+
+先只获取远程提交，不立即修改当前代码：
+
+```bash
+git fetch origin
+git log --oneline HEAD..origin/main
+```
+
+没有输出表示 VPS 已经是最新版。有提交时，记录升级前的版本，然后执行仅允许快进的更新：
+
+```bash
+git rev-parse HEAD
+git switch main
+git pull --ff-only origin main
+git rev-parse --short HEAD
+```
+
+如果 `git pull --ff-only` 报告无法快进或存在本地修改，应停止升级并检查 `git status` 和 `git diff`，不要强制覆盖。
+
+#### 3. 检查新增配置
+
+查看新版示例配置是否增加了变量：
+
+```bash
+git diff HEAD@{1} -- .env.example
+```
+
+根据差异手动把缺少的变量补到 `.env`。不要执行 `cp .env.example .env`，否则会覆盖现有 Bot Token、存储频道 ID 和其他正式配置。
+
+如果拉取前后没有形成 `HEAD@{1}` 记录，可直接打开 `.env.example`，与 `.env` 手动比较。
+
+#### 4. 在数据库迁移前备份
+
+最安全的方式是短暂停止机器人，再把 `data` 和 `.env` 备份到项目目录之外：
+
+```bash
+backup_dir="/opt/Channel-bottom-bot-backups/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup_dir"
+chmod 700 "$backup_dir"
+docker compose stop bottom-post-bot
+cp -a data "$backup_dir/data"
+cp .env "$backup_dir/.env"
+chmod 600 "$backup_dir/.env"
+echo "备份位置：$backup_dir"
+```
+
+如果后续步骤暂时无法继续，可先执行 `docker compose start bottom-post-bot` 恢复旧容器。
+
+#### 5. 重建并启动新版
+
+检查 Compose 配置，然后重新构建镜像并创建容器：
+
+```bash
+docker compose config --quiet
+docker compose up -d --build --remove-orphans
+```
+
+`docker compose restart` 不会重新构建镜像，也不会载入 Compose 或 `.env` 的配置变化，因此代码升级不要只执行 `restart`。
+
+如果构建失败，通常仍可用上一次成功构建的镜像临时恢复服务：
+
+```bash
+docker compose up -d --no-build
+```
+
+#### 6. 验证升级结果
+
+确认容器处于运行状态，并检查启动日志：
+
+```bash
+docker compose ps
 docker compose logs --tail=100 bottom-post-bot
 ```
+
+需要持续观察日志时使用：
+
+```bash
+docker compose logs --tail=100 -f bottom-post-bot
+```
+
+随后在 Telegram 私聊机器人执行 `/start`；配置在 `OPERATOR_USER_IDS` 中的运维账号还可以执行 `/health`。日志没有持续报错、机器人能够响应命令，即表示升级完成。
+
+#### 7. 代码回退
+
+如果新版无法使用，可切换到第 2 步记录的旧提交并重新构建：
+
+```bash
+git switch --detach <升级前的完整提交哈希>
+docker compose up -d --build --remove-orphans
+docker compose logs --tail=100 bottom-post-bot
+```
+
+修复问题并准备重新升级时返回 `main`：
+
+```bash
+git switch main
+git pull --ff-only origin main
+docker compose up -d --build --remove-orphans
+```
+
+代码回退不会自动回退数据库。若新版执行了与旧版不兼容的数据库迁移，应按照本 README 的“备份与恢复”章节恢复升级前的 `data`；不要在机器人运行时直接覆盖数据库文件。
 
 ### Docker 常见启动错误
 
@@ -173,21 +293,24 @@ docker compose logs --tail=100 -f bottom-post-bot
 
 向槽位发布草稿时，空槽会自动采用草稿名作为显示名称。替换该槽位的草稿时，自动名称会同步更新；使用“改名”后的自定义名称会持久保留，不会被后续替换覆盖。
 
-URL 按钮必须严格一行一个、恰好三个字段：
+URL 按钮必须严格一行一个，支持带颜色的四字段格式：
 
 ```text
-按钮文字 | https://example.com | 行号
+按钮文字 | URL | 行号 | 颜色
 ```
 
 例如：
 
 ```text
-官网 | https://example.com | 1
-联系支持 | tg://resolve?domain=example | 1
-下载 | https://example.com/download | 2
+加入频道 | https://t.me/example | 1 | blue
+官方网站 | https://example.com | 1 | green
+重要提醒 | https://example.com/notice | 2 | red
+普通按钮 | https://example.com | 2 | default
 ```
 
-允许 `https://`、`http://` 和 `tg://` URL；行号从 1 开始。同一行最多 8 个按钮，一条消息总计最多 100 个按钮；空行会忽略，任何非空行都必须遵循上述三字段格式。批量输入会在完整校验后一次性追加，出错不会只保存其中一部分。
+颜色支持 `default`（默认）、`blue`（蓝色）、`green`（绿色）和 `red`（红色），不区分大小写。旧的三字段格式 `按钮文字 | URL | 行号` 仍然兼容，并自动使用 `default`。
+
+允许 `https://`、`http://` 和 `tg://` URL；行号从 1 开始。相同行号的按钮横向排列，不同行号另起一行。同一行最多 8 个按钮，一条消息总计最多 100 个按钮；空行会忽略。批量输入会在完整校验后一次性追加，出错不会只保存其中一部分。
 
 ### 自动发现、暂停与恢复
 

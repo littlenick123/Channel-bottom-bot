@@ -169,7 +169,7 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
             media_kind="photo",
             telegram_file_id="photo-file",
         )
-        buttons = [ButtonSpec("官网", "https://example.com", 0, 0)]
+        buttons = [ButtonSpec("官网", "https://example.com", 0, 0, "green")]
 
         ids = await gateway.send_content(-1007, item, buttons, silent=True)
 
@@ -177,6 +177,24 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.photo_calls[0]["photo"], "photo-file")
         self.assertTrue(bot.photo_calls[0]["disable_notification"])
         self.assertEqual(bot.photo_calls[0]["reply_markup"].inline_keyboard[0][0].url, "https://example.com")
+        self.assertEqual(bot.photo_calls[0]["reply_markup"].inline_keyboard[0][0].style, "success")
+
+    async def test_button_colors_map_to_telegram_styles(self) -> None:
+        markup = BotApiGateway._build_buttons(
+            [
+                ButtonSpec("默认", "https://example.com/default", 0, 0),
+                ButtonSpec("蓝色", "https://example.com/blue", 0, 1, "blue"),
+                ButtonSpec("绿色", "https://example.com/green", 1, 0, "green"),
+                ButtonSpec("红色", "https://example.com/red", 1, 1, "red"),
+            ]
+        )
+
+        self.assertIsNotNone(markup)
+        self.assertEqual(
+            [[button.style for button in row] for row in markup.inline_keyboard],
+            [[None, "primary"], ["success", "danger"]],
+        )
+        self.assertNotIn("style", markup.inline_keyboard[0][0].model_dump(exclude_none=True))
 
     async def test_send_album_uses_media_group(self) -> None:
         bot = FakeBot()
@@ -186,10 +204,16 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
             ContentItem(storage_message_id=2, media_kind="photo", grouped_id="g", telegram_file_id="p2"),
         ]
 
-        ids = await gateway.send_content_group(-1007, items, (), silent=False)
+        ids = await gateway.send_content_group(
+            -1007,
+            items,
+            (ButtonSpec("提醒", "https://example.com/notice", 0, 0, "red"),),
+            silent=False,
+        )
 
-        self.assertEqual(ids, [910, 911])
+        self.assertEqual(ids, [910, 911, 901])
         self.assertEqual([media.media for media in bot.album_calls[0]["media"]], ["p1", "p2"])
+        self.assertEqual(bot.message_calls[0]["reply_markup"].inline_keyboard[0][0].style, "danger")
 
     async def test_publish_failures_use_channel_or_supergroup_wording(self) -> None:
         bot = FakeBot()

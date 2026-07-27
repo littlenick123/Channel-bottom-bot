@@ -261,6 +261,12 @@ MIGRATION_7 = (
     "ALTER TABLE chat_analytics_state ADD COLUMN interruption_reason TEXT",
 )
 
+MIGRATION_8 = (
+    """ALTER TABLE draft_buttons
+       ADD COLUMN style TEXT NOT NULL DEFAULT 'default'
+       CHECK (style IN ('default', 'blue', 'green', 'red'))""",
+)
+
 
 class Database:
     def __init__(self, connection: aiosqlite.Connection) -> None:
@@ -355,6 +361,12 @@ class Database:
                     for statement in MIGRATION_7:
                         await self.connection.execute(statement)
                     await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (7)")
+                await self.connection.commit()
+                if version < 8:
+                    await self.connection.execute("BEGIN IMMEDIATE")
+                    for statement in MIGRATION_8:
+                        await self.connection.execute(statement)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (8)")
                 await self.connection.commit()
             except Exception:
                 await self.connection.rollback()
