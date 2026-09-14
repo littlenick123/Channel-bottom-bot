@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Protocol, Sequence
 
-from .domain import ButtonSpec, ContentItem, SlotSnapshot, enabled_slots_in_publish_order, group_content_items
+from .domain import ButtonSpec, ContentItem, PublishedMessageRef, SlotSnapshot, enabled_slots_in_publish_order, group_content_items
 
 
 class RefreshOutcome(StrEnum):
@@ -32,7 +32,7 @@ class TelegramGateway(Protocol):
         item: ContentItem,
         buttons: Sequence[ButtonSpec],
         silent: bool,
-    ) -> list[int]: ...
+    ) -> list[PublishedMessageRef]: ...
 
     async def send_content_group(
         self,
@@ -40,7 +40,7 @@ class TelegramGateway(Protocol):
         items: Sequence[ContentItem],
         buttons: Sequence[ButtonSpec],
         silent: bool,
-    ) -> list[int]: ...
+    ) -> list[PublishedMessageRef]: ...
 
 
 class PublishState(Protocol):
@@ -50,7 +50,9 @@ class PublishState(Protocol):
 
     async def begin_batch(self, channel_id: int) -> int: ...
 
-    async def record_batch_messages(self, batch_id: int, message_ids: list[int]) -> None: ...
+    async def record_batch_results(self, batch_id: int, messages: Sequence[PublishedMessageRef]) -> None: ...
+
+    async def acknowledge_deleted_messages(self, channel_id: int, message_ids: Sequence[int]) -> None: ...
 
     async def finalize_batch(self, channel_id: int, batch_id: int) -> None: ...
 
@@ -70,6 +72,7 @@ class Publisher:
         if not ordered:
             if previous_ids:
                 await self._gateway.delete_messages(channel_id, previous_ids)
+                await self._state.acknowledge_deleted_messages(channel_id, previous_ids)
                 await self._state.commit_batch(channel_id, [])
             return RefreshOutcome.SKIPPED
 
@@ -78,16 +81,17 @@ class Publisher:
         try:
             if previous_ids:
                 await self._gateway.delete_messages(channel_id, previous_ids)
+                await self._state.acknowledge_deleted_messages(channel_id, previous_ids)
             for slot in ordered:
                 groups = group_content_items(slot.revision.items)
                 for index, items in enumerate(groups):
                     buttons = slot.revision.buttons if index == len(groups) - 1 else ()
                     if len(items) > 1 and items[0].grouped_id:
-                        new_ids = await self._gateway.send_content_group(channel_id, items, buttons, silent)
+                        new_messages = await self._gateway.send_content_group(channel_id, items, buttons, silent)
                     else:
-                        new_ids = await self._gateway.send_content(channel_id, items[0], buttons, silent)
-                    sent_ids.extend(new_ids)
-                    await self._state.record_batch_messages(batch_id, new_ids)
+                        new_messages = await self._gateway.send_content(channel_id, items[0], buttons, silent)
+                    sent_ids.extend(message.message_id for message in new_messages if message.message_id > 0)
+                    await self._state.record_batch_results(batch_id, new_messages)
         except Exception as exc:
             needs_cleanup = False
             if sent_ids:

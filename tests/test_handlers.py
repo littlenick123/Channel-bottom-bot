@@ -12,12 +12,18 @@ class FakeRepository:
         self.managed = managed
         self.current = current
         self.delay = delay
+        self.pending_resolution = None
+        self.resolve_calls = []
 
     async def channel_refresh_delay(self, channel_id):
         return self.delay if self.managed else None
 
     async def is_current_sent_message(self, channel_id, message_id):
         return self.current
+
+    async def resolve_pending_sent_message(self, channel_id, fingerprint, message_id):
+        self.resolve_calls.append((channel_id, fingerprint, message_id))
+        return self.pending_resolution
 
 
 class FakeScheduler:
@@ -101,6 +107,40 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(chat_id=-1007, id=12, out=False, message=SimpleNamespace(action=None))
         await listener.handle(event)
         self.assertEqual(scheduler.calls, [])
+
+    async def test_resolves_scheduled_video_delivery_without_starting_refresh_loop(self) -> None:
+        repo = FakeRepository()
+        repo.pending_resolution = "current"
+        scheduler = FakeScheduler()
+        listener = ChannelListener(repo, scheduler)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-1007),
+            message_id=321,
+            content_type="video",
+            video=SimpleNamespace(file_unique_id="video-unique", file_id="video-file"),
+            caption="caption",
+        )
+
+        await listener.handle(message)
+
+        self.assertEqual(scheduler.calls, [])
+        self.assertEqual(repo.resolve_calls[0][0::2], (-1007, 321))
+
+    async def test_late_delivery_from_old_batch_is_queued_for_immediate_cleanup(self) -> None:
+        repo = FakeRepository()
+        repo.pending_resolution = "orphan"
+        scheduler = FakeScheduler()
+        listener = ChannelListener(repo, scheduler)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-1007),
+            message_id=322,
+            content_type="video",
+            video=SimpleNamespace(file_unique_id="video-unique", file_id="video-file"),
+        )
+
+        await listener.handle(message)
+
+        self.assertEqual(scheduler.calls, [(-1007, "scheduled-message-recovery:322", 0)])
 
     async def test_ignores_outgoing_and_unmanaged_messages(self) -> None:
         scheduler = FakeScheduler()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from aiogram.enums import ContentType
 
+from .aiogram_gateway import outgoing_message_fingerprint
+
 
 _USER_CONTENT_TYPES = frozenset(
     {
@@ -61,6 +63,13 @@ class ChannelListener:
         message_id = int(getattr(event, "message_id", getattr(event, "id", 0)))
         delay = await self.repository.channel_refresh_delay(channel_id)
         if delay is None:
+            return
+        resolution = await self.repository.resolve_pending_sent_message(
+            channel_id, outgoing_message_fingerprint(event), message_id
+        )
+        if resolution is not None:
+            if resolution == "orphan":
+                await self.scheduler.request(channel_id, f"scheduled-message-recovery:{message_id}", 0)
             return
         if await self.repository.is_current_sent_message(channel_id, message_id):
             return

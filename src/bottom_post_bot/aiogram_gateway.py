@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import defaultdict
 from collections.abc import Sequence
@@ -25,7 +26,7 @@ from aiogram.types import (
 )
 
 from .channels import ChannelIdentity, UnsupportedChatTypeError
-from .domain import ButtonSpec, ContentItem
+from .domain import ButtonSpec, ContentItem, PublishedMessageRef
 from .drafts import IncomingContent
 from .permissions import BotCapabilities, PermissionUnavailable
 from .publisher import FloodWaitSignal, PermanentPublishError
@@ -38,6 +39,35 @@ ADMIN_STATUSES = {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, "cre
 
 def _message_id(value) -> int:
     return int(getattr(value, "message_id", getattr(value, "id", 0)))
+
+
+def outgoing_message_fingerprint(value) -> str:
+    content_type = getattr(value, "content_type", "unknown")
+    content_type = str(getattr(content_type, "value", content_type))
+    media_identity = ""
+    for name in ("animation", "audio", "document", "video", "video_note", "voice", "sticker"):
+        media = getattr(value, name, None)
+        if media is not None:
+            media_identity = str(getattr(media, "file_unique_id", None) or getattr(media, "file_id", ""))
+            content_type = name
+            break
+    else:
+        photos = getattr(value, "photo", None) or ()
+        if photos:
+            media = photos[-1]
+            media_identity = str(getattr(media, "file_unique_id", None) or getattr(media, "file_id", ""))
+            content_type = "photo"
+    payload = json.dumps(
+        [content_type, media_identity, getattr(value, "text", None) or getattr(value, "caption", None) or ""],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _published_message(value) -> PublishedMessageRef:
+    message_id = _message_id(value)
+    return PublishedMessageRef(message_id, outgoing_message_fingerprint(value) if message_id == 0 else None)
 
 
 def _message_is_already_absent(exc: TelegramBadRequest) -> bool:
@@ -178,7 +208,7 @@ class BotApiGateway:
         item: ContentItem,
         buttons: Sequence[ButtonSpec],
         silent: bool,
-    ) -> list[int]:
+    ) -> list[PublishedMessageRef]:
         common = {
             "chat_id": channel_id,
             "disable_notification": silent,
@@ -195,7 +225,7 @@ class BotApiGateway:
                 )
             else:
                 sent = await self._send_media(item, entities, common)
-            return [_message_id(sent)]
+            return [_published_message(sent)]
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
@@ -229,7 +259,7 @@ class BotApiGateway:
         items: Sequence[ContentItem],
         buttons: Sequence[ButtonSpec],
         silent: bool,
-    ) -> list[int]:
+    ) -> list[PublishedMessageRef]:
         try:
             media = [self._input_media(item) for item in items]
             sent = await self.bot.send_media_group(
@@ -237,7 +267,7 @@ class BotApiGateway:
                 media=media,
                 disable_notification=silent,
             )
-            ids = [_message_id(message) for message in sent]
+            messages = [_published_message(message) for message in sent]
             if buttons:
                 button_message = await self.bot.send_message(
                     chat_id=channel_id,
@@ -245,8 +275,8 @@ class BotApiGateway:
                     reply_markup=self._build_buttons(buttons),
                     disable_notification=silent,
                 )
-                ids.append(_message_id(button_message))
-            return ids
+                messages.append(_published_message(button_message))
+            return messages
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:

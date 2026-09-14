@@ -14,6 +14,7 @@ from .domain import (
     Draft,
     DraftRevision,
     PendingDraft,
+    PublishedMessageRef,
     RefreshJob,
     SlotSnapshot,
 )
@@ -644,10 +645,10 @@ class Repository:
             """SELECT message_id, position FROM (
                    SELECT m.message_id AS message_id, m.position AS position
                    FROM sent_messages m JOIN sent_batches b ON b.id=m.batch_id
-                   WHERE b.channel_id=? AND b.is_current=1
+                   WHERE b.channel_id=? AND b.is_current=1 AND m.message_id > 0
                    UNION
                    SELECT o.message_id AS message_id, 1000000 AS position
-                   FROM orphan_messages o WHERE o.channel_id=?
+                   FROM orphan_messages o WHERE o.channel_id=? AND o.message_id > 0
                ) ORDER BY position""",
             (channel_id, channel_id),
         )
@@ -680,15 +681,92 @@ class Repository:
             return int(cursor.lastrowid)
 
     async def record_batch_messages(self, batch_id: int, message_ids: list[int]) -> None:
+        if any(message_id <= 0 for message_id in message_ids):
+            raise ValueError("sent message IDs must be positive")
+        await self.record_batch_results(batch_id, [PublishedMessageRef(message_id) for message_id in message_ids])
+
+    async def record_batch_results(self, batch_id: int, messages: Sequence[PublishedMessageRef]) -> None:
+        if not messages:
+            return
         async with self.db.transaction() as connection:
+            batch = await (
+                await connection.execute("SELECT channel_id FROM sent_batches WHERE id=?", (batch_id,))
+            ).fetchone()
+            if not batch:
+                raise LookupError(f"batch {batch_id} not found")
             row = await (
-                await connection.execute("SELECT COALESCE(MAX(position), -1) + 1 FROM sent_messages WHERE batch_id=?", (batch_id,))
+                await connection.execute(
+                    """SELECT COALESCE(MAX(position), -1) + 1 FROM (
+                           SELECT position FROM sent_messages WHERE batch_id=?
+                           UNION ALL
+                           SELECT position FROM pending_sent_messages WHERE batch_id=?
+                       )""",
+                    (batch_id, batch_id),
+                )
             ).fetchone()
             start = int(row[0])
-            await connection.executemany(
-                "INSERT OR IGNORE INTO sent_messages(batch_id, message_id, position) VALUES (?, ?, ?)",
-                [(batch_id, message_id, start + offset) for offset, message_id in enumerate(message_ids)],
+            for offset, message in enumerate(messages):
+                position = start + offset
+                if message.message_id > 0:
+                    await connection.execute(
+                        "INSERT INTO sent_messages(batch_id, message_id, position) VALUES (?, ?, ?)",
+                        (batch_id, message.message_id, position),
+                    )
+                else:
+                    await connection.execute(
+                        """INSERT INTO pending_sent_messages(batch_id, channel_id, position, fingerprint)
+                           VALUES (?, ?, ?, ?)""",
+                        (batch_id, int(batch["channel_id"]), position, message.fingerprint),
+                    )
+
+    async def resolve_pending_sent_message(
+        self, channel_id: int, fingerprint: str, message_id: int
+    ) -> str | None:
+        if message_id <= 0:
+            return None
+        async with self.db.transaction() as connection:
+            pending = await (
+                await connection.execute(
+                    """SELECT p.id, p.batch_id, p.position, b.status, b.is_current,
+                              EXISTS(
+                                  SELECT 1 FROM sent_batches newer
+                                  WHERE newer.channel_id=p.channel_id
+                                    AND newer.status='sending'
+                                    AND newer.id<>p.batch_id
+                              ) AS superseded
+                       FROM pending_sent_messages p
+                       JOIN sent_batches b ON b.id=p.batch_id
+                       WHERE p.channel_id=? AND p.fingerprint=?
+                       ORDER BY p.id LIMIT 1""",
+                    (channel_id, fingerprint),
+                )
+            ).fetchone()
+            if not pending:
+                return None
+            await connection.execute("DELETE FROM pending_sent_messages WHERE id=?", (pending["id"],))
+            if pending["status"] == "sending" or (
+                bool(pending["is_current"]) and not bool(pending["superseded"])
+            ):
+                await connection.execute(
+                    "INSERT OR IGNORE INTO sent_messages(batch_id, message_id, position) VALUES (?, ?, ?)",
+                    (pending["batch_id"], message_id, pending["position"]),
+                )
+                return "current"
+            await connection.execute(
+                "INSERT OR IGNORE INTO orphan_messages(channel_id, message_id) VALUES (?, ?)",
+                (channel_id, message_id),
             )
+            return "orphan"
+
+    async def acknowledge_deleted_messages(self, channel_id: int, message_ids: Sequence[int]) -> None:
+        positive_ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
+        if not positive_ids:
+            return
+        placeholders = ",".join("?" for _ in positive_ids)
+        await self.db.execute(
+            f"DELETE FROM orphan_messages WHERE channel_id=? AND message_id IN ({placeholders})",
+            (channel_id, *positive_ids),
+        )
 
     async def fail_batch(self, batch_id: int, error: str, *, needs_cleanup: bool) -> None:
         async with self.db.transaction() as connection:
@@ -717,7 +795,6 @@ class Repository:
                    WHERE id=? AND channel_id=?""",
                 (batch_id, channel_id),
             )
-            await connection.execute("DELETE FROM orphan_messages WHERE channel_id=?", (channel_id,))
             await connection.execute(
                 """UPDATE channels SET status='active', last_error=NULL, updated_at=CURRENT_TIMESTAMP
                    WHERE id=? AND status!='paused'""",
@@ -749,6 +826,8 @@ class Repository:
             return len(rows)
 
     async def commit_batch(self, channel_id: int, message_ids: list[int]) -> None:
+        if any(message_id <= 0 for message_id in message_ids):
+            raise ValueError("sent message IDs must be positive")
         async with self.db.transaction() as connection:
             await connection.execute("UPDATE sent_batches SET is_current=0 WHERE channel_id=?", (channel_id,))
             cursor = await connection.execute(
@@ -761,7 +840,6 @@ class Repository:
                 "INSERT INTO sent_messages(batch_id, message_id, position) VALUES (?, ?, ?)",
                 [(batch_id, message_id, position) for position, message_id in enumerate(message_ids)],
             )
-            await connection.execute("DELETE FROM orphan_messages WHERE channel_id=?", (channel_id,))
             await connection.execute(
                 "UPDATE channels SET status='active', last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                 (channel_id,),

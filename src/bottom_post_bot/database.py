@@ -267,6 +267,23 @@ MIGRATION_8 = (
        CHECK (style IN ('default', 'blue', 'green', 'red'))""",
 )
 
+MIGRATION_9 = (
+    """
+    CREATE TABLE pending_sent_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER NOT NULL REFERENCES sent_batches(id) ON DELETE CASCADE,
+        channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (batch_id, position)
+    )
+    """,
+    "CREATE INDEX idx_pending_sent_messages_match ON pending_sent_messages(channel_id, fingerprint, id)",
+    "DELETE FROM sent_messages WHERE message_id <= 0",
+    "DELETE FROM orphan_messages WHERE message_id <= 0",
+)
+
 
 class Database:
     def __init__(self, connection: aiosqlite.Connection) -> None:
@@ -367,6 +384,12 @@ class Database:
                     for statement in MIGRATION_8:
                         await self.connection.execute(statement)
                     await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (8)")
+                await self.connection.commit()
+                if version < 9:
+                    await self.connection.execute("BEGIN IMMEDIATE")
+                    for statement in MIGRATION_9:
+                        await self.connection.execute(statement)
+                    await self.connection.execute("INSERT INTO schema_migrations(version) VALUES (9)")
                 await self.connection.commit()
             except Exception:
                 await self.connection.rollback()

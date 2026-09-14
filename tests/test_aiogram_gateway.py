@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import GetMe
 
-from bottom_post_bot.aiogram_gateway import BotApiGateway, BotApiPermissionGateway
-from bottom_post_bot.domain import ButtonSpec, ContentItem
+from bottom_post_bot.aiogram_gateway import BotApiGateway, BotApiPermissionGateway, outgoing_message_fingerprint
+from bottom_post_bot.domain import ButtonSpec, ContentItem, PublishedMessageRef
 from bottom_post_bot.drafts import IncomingContent
 from bottom_post_bot.permissions import PermissionUnavailable
 from bottom_post_bot.publisher import FloodWaitSignal, PermanentPublishError
@@ -17,6 +17,7 @@ class FakeBot:
         self.copy_calls = []
         self.message_calls = []
         self.photo_calls = []
+        self.video_calls = []
         self.album_calls = []
         self.delete_calls = []
         self.copy_error = None
@@ -43,7 +44,16 @@ class FakeBot:
 
     async def send_photo(self, **kwargs):
         self.photo_calls.append(kwargs)
-        return SimpleNamespace(message_id=902)
+        return SimpleNamespace(message_id=902, content_type="photo", photo=[])
+
+    async def send_video(self, **kwargs):
+        self.video_calls.append(kwargs)
+        return SimpleNamespace(
+            message_id=0,
+            content_type="video",
+            video=SimpleNamespace(file_id=kwargs["video"], file_unique_id="video-unique"),
+            caption=kwargs.get("caption"),
+        )
 
     async def send_media_group(self, **kwargs):
         self.album_calls.append(kwargs)
@@ -173,7 +183,7 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
 
         ids = await gateway.send_content(-1007, item, buttons, silent=True)
 
-        self.assertEqual(ids, [902])
+        self.assertEqual(ids, [PublishedMessageRef(902)])
         self.assertEqual(bot.photo_calls[0]["photo"], "photo-file")
         self.assertTrue(bot.photo_calls[0]["disable_notification"])
         self.assertEqual(bot.photo_calls[0]["reply_markup"].inline_keyboard[0][0].url, "https://example.com")
@@ -211,9 +221,25 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
             silent=False,
         )
 
-        self.assertEqual(ids, [910, 911, 901])
+        self.assertEqual([message.message_id for message in ids], [910, 911, 901])
         self.assertEqual([media.media for media in bot.album_calls[0]["media"]], ["p1", "p2"])
         self.assertEqual(bot.message_calls[0]["reply_markup"].inline_keyboard[0][0].style, "danger")
+
+    async def test_scheduled_video_id_zero_has_stable_fingerprint_for_later_channel_post(self) -> None:
+        bot = FakeBot()
+        gateway = BotApiGateway(bot, storage_channel_id=-10050)
+        item = ContentItem(text="caption", media_kind="video", telegram_file_id="video-file")
+
+        refs = await gateway.send_content(-1007, item, (), silent=True)
+        delivered = SimpleNamespace(
+            message_id=321,
+            content_type="video",
+            video=SimpleNamespace(file_id="different-file-id", file_unique_id="video-unique"),
+            caption="caption",
+        )
+
+        self.assertEqual(refs[0].message_id, 0)
+        self.assertEqual(refs[0].fingerprint, outgoing_message_fingerprint(delivered))
 
     async def test_publish_failures_use_channel_or_supergroup_wording(self) -> None:
         bot = FakeBot()

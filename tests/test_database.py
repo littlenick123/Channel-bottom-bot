@@ -10,7 +10,7 @@ import aiosqlite
 
 from bottom_post_bot import database
 from bottom_post_bot.database import Database
-from bottom_post_bot.domain import ButtonSpec, ContentItem
+from bottom_post_bot.domain import ButtonSpec, ContentItem, PublishedMessageRef
 from bottom_post_bot.handlers import BotHandlers
 from bottom_post_bot.repositories import AuthorizationError, Repository, ResourceLimitError
 
@@ -31,7 +31,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         version = await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations")
         self.assertEqual(foreign_keys, 1)
         self.assertEqual(str(journal_mode).lower(), "wal")
-        self.assertEqual(version, 8)
+        self.assertEqual(version, 9)
 
     async def test_migration_four_backfills_slot_names_from_existing_drafts(self) -> None:
         await self.db.close()
@@ -40,7 +40,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 9)
         slot = await self.db.fetch_one(
             "SELECT display_name, name_customized FROM channel_slots WHERE channel_id=? AND slot_number=?",
             (-1009, 1),
@@ -111,7 +111,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.db = await Database.open(database_path)
         self.repo = Repository(self.db)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 9)
         active_buttons = await self.db.fetch_all("SELECT id, url, style FROM draft_buttons ORDER BY id")
         self.assertEqual(
             [(row["id"], row["url"], row["style"]) for row in active_buttons],
@@ -149,7 +149,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 9)
         columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channels)")}
         self.assertIn("chat_type", columns)
         manager_columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(channel_managers)")}
@@ -190,7 +190,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
         self.db = await Database.open(database_path)
 
-        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 9)
         self.assertEqual(await self.db.fetch_value("SELECT style FROM draft_buttons"), "default")
 
     async def test_migration_eight_rolls_back_column_when_later_statement_fails(self) -> None:
@@ -213,6 +213,52 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 7)
         columns = {row["name"] for row in await self.db.fetch_all("PRAGMA table_info(draft_buttons)")}
         self.assertNotIn("style", columns)
+
+    async def test_migration_nine_removes_legacy_zero_ids_and_adds_pending_tracking(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v8.sqlite3"
+        self._create_version_eight_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            batch_id = connection.execute(
+                "INSERT INTO sent_batches(channel_id, status, is_current) VALUES (?, 'complete', 1)",
+                (-1009,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO sent_messages(batch_id, message_id, position) VALUES (?, 0, 0)",
+                (batch_id,),
+            )
+            connection.execute("INSERT INTO orphan_messages(channel_id, message_id) VALUES (?, 0)", (-1009,))
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.db = await Database.open(database_path)
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 9)
+        self.assertIsNotNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='pending_sent_messages'"))
+        self.assertEqual(await self.db.fetch_value("SELECT COUNT(*) FROM sent_messages WHERE message_id<=0"), 0)
+        self.assertEqual(await self.db.fetch_value("SELECT COUNT(*) FROM orphan_messages WHERE message_id<=0"), 0)
+
+    async def test_migration_nine_rolls_back_all_changes_when_a_statement_fails(self) -> None:
+        await self.db.close()
+        database_path = Path(self.tempdir.name) / "legacy-v8-rollback.sqlite3"
+        self._create_version_eight_database(database_path)
+        connection = await aiosqlite.connect(database_path)
+        connection.row_factory = aiosqlite.Row
+        self.db = Database(connection)
+        await self.db._configure()
+
+        original_migration = database.MIGRATION_9
+        database.MIGRATION_9 = (*original_migration, "THIS IS NOT VALID SQL")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                await self.db._migrate()
+        finally:
+            database.MIGRATION_9 = original_migration
+
+        self.assertEqual(await self.db.fetch_value("SELECT MAX(version) FROM schema_migrations"), 8)
+        self.assertIsNone(await self.db.fetch_one("SELECT name FROM sqlite_master WHERE name='pending_sent_messages'"))
 
     async def test_migration_six_rolls_back_every_statement_when_one_fails(self) -> None:
         await self.db.close()
@@ -483,6 +529,53 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.repo.record_batch_messages(batch_id, [888])
         self.assertTrue(await self.repo.is_current_sent_message(-1009, 888))
 
+    async def test_scheduled_message_is_resolved_into_current_batch_with_real_id(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        batch_id = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_results(batch_id, [PublishedMessageRef(0, "video-fingerprint")])
+        await self.repo.finalize_batch(-1009, batch_id)
+
+        resolution = await self.repo.resolve_pending_sent_message(-1009, "video-fingerprint", 889)
+
+        self.assertEqual(resolution, "current")
+        self.assertTrue(await self.repo.is_current_sent_message(-1009, 889))
+        self.assertEqual(await self.db.fetch_value("SELECT COUNT(*) FROM pending_sent_messages"), 0)
+
+    async def test_late_scheduled_message_from_old_batch_becomes_orphan(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        old_batch = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_results(old_batch, [PublishedMessageRef(0, "video-fingerprint")])
+        await self.repo.finalize_batch(-1009, old_batch)
+        await self.repo.commit_batch(-1009, [])
+
+        resolution = await self.repo.resolve_pending_sent_message(-1009, "video-fingerprint", 890)
+        _, cleanup_ids, _ = await self.repo.load_publish_state(-1009)
+
+        self.assertEqual(resolution, "orphan")
+        self.assertEqual(cleanup_ids, [890])
+
+    async def test_late_old_delivery_during_replacement_batch_is_already_an_orphan(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        old_batch = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_results(old_batch, [PublishedMessageRef(0, "video-fingerprint")])
+        await self.repo.finalize_batch(-1009, old_batch)
+        await self.repo.begin_batch(-1009)
+
+        resolution = await self.repo.resolve_pending_sent_message(-1009, "video-fingerprint", 891)
+
+        self.assertEqual(resolution, "orphan")
+        self.assertEqual(await self.db.fetch_value("SELECT message_id FROM orphan_messages"), 891)
+
+    async def test_acknowledging_known_cleanup_does_not_drop_concurrently_discovered_orphan(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        await self.db.execute("INSERT INTO orphan_messages(channel_id, message_id) VALUES (?, ?)", (-1009, 901))
+        await self.db.execute("INSERT INTO orphan_messages(channel_id, message_id) VALUES (?, ?)", (-1009, 902))
+
+        await self.repo.acknowledge_deleted_messages(-1009, [901])
+
+        rows = await self.db.fetch_all("SELECT message_id FROM orphan_messages ORDER BY message_id")
+        self.assertEqual([row["message_id"] for row in rows], [902])
+
     async def test_finalize_batch_preserves_concurrent_access_loss_pause_for_recovery(self) -> None:
         await self.repo.upsert_user(1, "Alice")
         await self.repo.upsert_channel(-1009, "Channel", None)
@@ -578,6 +671,18 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             for statement in database.MIGRATION_7:
                 connection.execute(statement)
             connection.execute("INSERT INTO schema_migrations(version) VALUES (7)")
+            connection.commit()
+        finally:
+            connection.close()
+
+    @classmethod
+    def _create_version_eight_database(cls, database_path: Path) -> None:
+        cls._create_version_seven_database(database_path)
+        connection = sqlite3.connect(database_path)
+        try:
+            for statement in database.MIGRATION_8:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_migrations(version) VALUES (8)")
             connection.commit()
         finally:
             connection.close()

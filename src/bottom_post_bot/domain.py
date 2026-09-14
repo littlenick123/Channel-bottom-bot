@@ -72,6 +72,18 @@ class ButtonSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class PublishedMessageRef:
+    message_id: int
+    fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.message_id < 0:
+            raise ValidationError("published message ID cannot be negative")
+        if self.message_id == 0 and not self.fingerprint:
+            raise ValidationError("scheduled message requires a fingerprint")
+
+
+@dataclass(frozen=True, slots=True)
 class DraftRevision:
     id: int
     revision_number: int
