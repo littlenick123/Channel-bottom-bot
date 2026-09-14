@@ -234,7 +234,7 @@ class BotApiGatewayTests(unittest.IsolatedAsyncioTestCase):
         delivered = SimpleNamespace(
             message_id=321,
             content_type="video",
-            video=SimpleNamespace(file_id="different-file-id", file_unique_id="video-unique"),
+            video=SimpleNamespace(file_id="different-file-id", file_unique_id="transcoded-unique-id"),
             caption="caption",
         )
 

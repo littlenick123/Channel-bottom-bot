@@ -44,30 +44,39 @@ def _message_id(value) -> int:
 def outgoing_message_fingerprint(value) -> str:
     content_type = getattr(value, "content_type", "unknown")
     content_type = str(getattr(content_type, "value", content_type))
-    media_identity = ""
     for name in ("animation", "audio", "document", "video", "video_note", "voice", "sticker"):
         media = getattr(value, name, None)
         if media is not None:
-            media_identity = str(getattr(media, "file_unique_id", None) or getattr(media, "file_id", ""))
             content_type = name
             break
     else:
         photos = getattr(value, "photo", None) or ()
         if photos:
-            media = photos[-1]
-            media_identity = str(getattr(media, "file_unique_id", None) or getattr(media, "file_id", ""))
             content_type = "photo"
+    return _content_fingerprint(
+        content_type, getattr(value, "text", None) or getattr(value, "caption", None) or ""
+    )
+
+
+def _content_fingerprint(content_type: str, text: str) -> str:
     payload = json.dumps(
-        [content_type, media_identity, getattr(value, "text", None) or getattr(value, "caption", None) or ""],
+        [content_type.lower(), text],
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _published_message(value) -> PublishedMessageRef:
+def _published_message(value, *, content_type: str | None = None, text: str | None = None) -> PublishedMessageRef:
     message_id = _message_id(value)
-    return PublishedMessageRef(message_id, outgoing_message_fingerprint(value) if message_id == 0 else None)
+    if message_id > 0:
+        return PublishedMessageRef(message_id)
+    fingerprint = (
+        _content_fingerprint(content_type, text or "")
+        if content_type is not None
+        else outgoing_message_fingerprint(value)
+    )
+    return PublishedMessageRef(0, fingerprint)
 
 
 def _message_is_already_absent(exc: TelegramBadRequest) -> bool:
@@ -225,7 +234,13 @@ class BotApiGateway:
                 )
             else:
                 sent = await self._send_media(item, entities, common)
-            return [_published_message(sent)]
+            return [
+                _published_message(
+                    sent,
+                    content_type=item.media_kind.lower() if item.media_kind else "text",
+                    text=item.text or "",
+                )
+            ]
         except TelegramRetryAfter as exc:
             raise FloodWaitSignal(exc.retry_after) from exc
         except (TelegramForbiddenError, TelegramBadRequest) as exc:
@@ -267,7 +282,14 @@ class BotApiGateway:
                 media=media,
                 disable_notification=silent,
             )
-            messages = [_published_message(message) for message in sent]
+            messages = [
+                _published_message(
+                    message,
+                    content_type=item.media_kind.lower() if item.media_kind else "document",
+                    text=item.text or "",
+                )
+                for message, item in zip(sent, items, strict=True)
+            ]
             if buttons:
                 button_message = await self.bot.send_message(
                     chat_id=channel_id,
