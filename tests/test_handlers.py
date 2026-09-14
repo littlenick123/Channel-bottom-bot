@@ -117,10 +117,12 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
             chat=SimpleNamespace(id=-1007),
             message_id=321,
             content_type="video",
+            from_user=SimpleNamespace(id=999, is_bot=True),
             video=SimpleNamespace(file_unique_id="video-unique", file_id="video-file"),
             caption="caption",
         )
 
+        listener = ChannelListener(repo, scheduler, bot_user_id=999)
         await listener.handle(message)
 
         self.assertEqual(scheduler.calls, [])
