@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import date
 from typing import Iterable, Sequence
@@ -18,6 +19,9 @@ from .domain import (
     RefreshJob,
     SlotSnapshot,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ResourceLimitError(ValueError):
@@ -742,6 +746,21 @@ class Repository:
                 )
             ).fetchone()
             if not pending:
+                if fingerprint is not None:
+                    candidates = await (
+                        await connection.execute(
+                            "SELECT fingerprint FROM pending_sent_messages WHERE channel_id=? ORDER BY id LIMIT 3",
+                            (channel_id,),
+                        )
+                    ).fetchall()
+                    if candidates:
+                        logger.warning(
+                            "Scheduled message fingerprint mismatch channel_id=%s message_id=%s incoming=%s pending=%s",
+                            channel_id,
+                            message_id,
+                            fingerprint[:12],
+                            [str(candidate["fingerprint"])[:12] for candidate in candidates],
+                        )
                 return None
             await connection.execute("DELETE FROM pending_sent_messages WHERE id=?", (pending["id"],))
             if pending["status"] == "sending" or (
