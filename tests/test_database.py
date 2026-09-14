@@ -541,6 +541,17 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.repo.is_current_sent_message(-1009, 889))
         self.assertEqual(await self.db.fetch_value("SELECT COUNT(*) FROM pending_sent_messages"), 0)
 
+    async def test_known_bot_delivery_can_resolve_oldest_pending_without_fingerprint(self) -> None:
+        await self.repo.upsert_channel(-1009, "Channel", None)
+        batch_id = await self.repo.begin_batch(-1009)
+        await self.repo.record_batch_results(batch_id, [PublishedMessageRef(0, "original-fingerprint")])
+        await self.repo.finalize_batch(-1009, batch_id)
+
+        resolution = await self.repo.resolve_pending_sent_message(-1009, None, 892)
+
+        self.assertEqual(resolution, "current")
+        self.assertTrue(await self.repo.is_current_sent_message(-1009, 892))
+
     async def test_late_scheduled_message_from_old_batch_becomes_orphan(self) -> None:
         await self.repo.upsert_channel(-1009, "Channel", None)
         old_batch = await self.repo.begin_batch(-1009)

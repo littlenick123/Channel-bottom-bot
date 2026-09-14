@@ -720,7 +720,7 @@ class Repository:
                     )
 
     async def resolve_pending_sent_message(
-        self, channel_id: int, fingerprint: str, message_id: int
+        self, channel_id: int, fingerprint: str | None, message_id: int
     ) -> str | None:
         if message_id <= 0:
             return None
@@ -736,9 +736,9 @@ class Repository:
                               ) AS superseded
                        FROM pending_sent_messages p
                        JOIN sent_batches b ON b.id=p.batch_id
-                       WHERE p.channel_id=? AND p.fingerprint=?
+                       WHERE p.channel_id=? AND (? IS NULL OR p.fingerprint=?)
                        ORDER BY p.id LIMIT 1""",
-                    (channel_id, fingerprint),
+                    (channel_id, fingerprint, fingerprint),
                 )
             ).fetchone()
             if not pending:

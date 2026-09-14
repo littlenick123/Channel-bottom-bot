@@ -144,6 +144,30 @@ class ChannelListenerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(scheduler.calls, [(-1007, "scheduled-message-recovery:322", 0)])
 
+    async def test_own_scheduled_video_falls_back_to_oldest_pending_when_telegram_changes_fingerprint(self) -> None:
+        repo = FakeRepository()
+        scheduler = FakeScheduler()
+        listener = ChannelListener(repo, scheduler, bot_user_id=999)
+
+        async def resolve(channel_id, fingerprint, message_id):
+            repo.resolve_calls.append((channel_id, fingerprint, message_id))
+            return "current" if fingerprint is None else None
+
+        repo.resolve_pending_sent_message = resolve
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=-1007),
+            message_id=323,
+            content_type="video",
+            from_user=SimpleNamespace(id=999, is_bot=True),
+            video=SimpleNamespace(file_unique_id="transcoded-video", file_id="new-file-id"),
+        )
+
+        await listener.handle(message)
+
+        self.assertEqual(len(repo.resolve_calls), 2)
+        self.assertIsNone(repo.resolve_calls[1][1])
+        self.assertEqual(scheduler.calls, [])
+
     async def test_ignores_outgoing_and_unmanaged_messages(self) -> None:
         scheduler = FakeScheduler()
         listener = ChannelListener(FakeRepository(managed=False), scheduler)

@@ -61,15 +61,22 @@ class ChannelListener:
         delay = await self.repository.channel_refresh_delay(channel_id)
         if delay is None:
             return
+        author = getattr(event, "from_user", None)
+        is_own_bot_message = (
+            author is not None
+            and self.bot_user_id is not None
+            and int(getattr(author, "id", 0)) == self.bot_user_id
+        )
         resolution = await self.repository.resolve_pending_sent_message(
             channel_id, outgoing_message_fingerprint(event), message_id
         )
+        if resolution is None and is_own_bot_message:
+            resolution = await self.repository.resolve_pending_sent_message(channel_id, None, message_id)
         if resolution is not None:
             if resolution == "orphan":
                 await self.scheduler.request(channel_id, f"scheduled-message-recovery:{message_id}", 0)
             return
-        author = getattr(event, "from_user", None)
-        if author is not None and self.bot_user_id is not None and int(getattr(author, "id", 0)) == self.bot_user_id:
+        if is_own_bot_message:
             return
         if await self.repository.is_current_sent_message(channel_id, message_id):
             return
